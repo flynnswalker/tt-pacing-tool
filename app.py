@@ -535,8 +535,36 @@ def main():
     if generate_clicked and st.session_state.course is not None:
         course = st.session_state.course
         
-        with st.spinner("Optimizing pacing..."):
+        # Create a container for the optimization log
+        log_container = st.container()
+        
+        with log_container:
+            st.subheader("Optimization Progress")
+            log_expander = st.expander("View optimization log", expanded=True)
+            log_placeholder = log_expander.empty()
+            status_placeholder = st.empty()
+            
+            # Store log messages
+            log_messages = []
+            
+            def log_callback(msg: str):
+                """Callback to update the log display."""
+                log_messages.append(msg)
+                # Show last 20 messages
+                log_text = "\n".join(log_messages[-25:])
+                log_placeholder.code(log_text, language=None)
+            
+            def progress_callback(update):
+                """Callback for optimization progress."""
+                status_placeholder.info(
+                    f"Iteration {update.iteration}: Best time {update.total_time_s:.1f}s "
+                    f"(saving {update.improvement_s:.1f}s) - Elapsed: {update.elapsed_s:.1f}s"
+                )
+            
+            status_placeholder.info("Starting optimization...")
+            
             # Build configs
+            log_callback("Building configuration...")
             aero_config = AeroConfig(
                 cda_flat=equipment['cda_flat'],
                 cda_climb=equipment['cda_climb'],
@@ -549,14 +577,18 @@ def main():
                 crr=equipment['crr'],
                 aero=aero_config
             )
+            log_callback(f"  Rider mass: {rider['mass']}kg, Crr: {equipment['crr']}")
+            log_callback(f"  CdA flat: {equipment['cda_flat']}, CdA climb: {equipment['cda_climb']}")
             
             # Get weather
+            log_callback("Fetching weather data...")
             if environment['use_forecast']:
                 weather = fetch_weather(
                     course.start_lat,
                     course.start_lon,
                     environment['race_datetime']
                 )
+                log_callback(f"  Forecast: {weather.temperature_c:.1f}°C, wind {weather.wind_speed_ms:.1f}m/s")
             else:
                 env_config = EnvironmentConfig(
                     use_forecast=False,
@@ -571,30 +603,46 @@ def main():
                     course.start_lon,
                     env_config
                 )
+                log_callback(f"  Manual: {weather.temperature_c:.1f}°C, wind {weather.wind_speed_ms:.1f}m/s")
+            log_callback(f"  Air density: {weather.air_density:.3f} kg/m³")
             st.session_state.weather = weather
             
             # Fit PDC
+            log_callback("Fitting power-duration curve...")
             pdc = fit_pdc(anchors)
             st.session_state.pdc = pdc
+            log_callback(f"  FTP estimate: {pdc.ftp_estimate():.0f}W")
+            log_callback(f"  5s max: {pdc.max_power(5):.0f}W, 1m max: {pdc.max_power(60):.0f}W")
             
             # Optimize
             opt_config = OptimizationConfig(
                 regularization=advanced['regularization'],
-                verbose=False
+                verbose=False,
+                progress_callback=progress_callback
             )
             
+            log_callback("")
             result = optimize_pacing(
-                course, weather, physics_config, pdc, opt_config
+                course, weather, physics_config, pdc, opt_config,
+                log_callback=log_callback
             )
             st.session_state.optimization_result = result
             
             # Auto-segment
+            log_callback("")
+            log_callback("Auto-segmenting course...")
             segments = auto_segment(
                 course, result.simulation,
                 grade_change_threshold=advanced['grade_seg_threshold'],
                 min_segment_m=advanced['min_segment_m']
             )
             st.session_state.segments = segments
+            log_callback(f"  Created {len(segments)} segments")
+            
+            status_placeholder.success(
+                f"Optimization complete! Time: {result.total_time_s:.1f}s "
+                f"(saved {result.time_saved_s:.1f}s / {result.time_saved_pct:.1f}%)"
+            )
     
     # Main content area with tabs
     course = st.session_state.course
