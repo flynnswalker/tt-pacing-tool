@@ -184,8 +184,9 @@ def auto_segment(
     
     powers = np.array([p.power_w for p in sim_result.points])
     
-    # Step 1: Start with segments at min_segment_m intervals
-    initial_segment_len = max(min_segment_m, total_distance / 20)  # ~20 initial segments
+    # Step 1: Start with FINE granularity to capture terrain changes
+    # Use 200m or total/50, whichever is smaller - we need detail first, then merge
+    initial_segment_len = min(200, total_distance / 50)
     
     boundaries = [0]
     for i in range(1, n_points):

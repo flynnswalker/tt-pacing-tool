@@ -348,8 +348,8 @@ def sidebar_advanced() -> dict:
             "Min Segment Length (m)",
             min_value=100,
             max_value=2000,
-            value=500,
-            step=100
+            value=200,
+            step=50
         )
         
         target_segments = st.number_input(
