@@ -156,74 +156,97 @@ def auto_segment(
     sim_result: SimulationResult,
     grade_change_threshold: float = 2.0,
     min_segment_m: float = 500.0,
-    max_segment_m: float = 5000.0
+    max_segment_m: float = 5000.0,  # Kept for API compatibility but not used
+    target_segments: int = 6
 ) -> List[Segment]:
     """
-    Automatically segment a course based on grade changes.
+    Automatically segment a course by clustering sections with similar target power.
+    
+    Strategy: Start with many small segments, then iteratively merge the most
+    similar adjacent pairs until we reach the target count.
     
     Args:
         course: Course to segment
         sim_result: Simulation result with power/speed/time
-        grade_change_threshold: Grade change to trigger new segment (%)
+        grade_change_threshold: Not used (kept for API compatibility)
         min_segment_m: Minimum segment length in meters
-        max_segment_m: Maximum segment length in meters
+        max_segment_m: Not used (kept for API compatibility)
+        target_segments: Target number of segments
         
     Returns:
         List of Segment objects
     """
     n_points = len(course.points)
+    total_distance = course.total_distance_m
     
     if n_points < 2:
         return []
     
-    # Find segment boundaries
-    boundaries = [0]  # Start with first point
+    powers = np.array([p.power_w for p in sim_result.points])
     
-    current_start = 0
-    running_grade_sum = 0.0
-    running_count = 0
+    # Step 1: Start with segments at min_segment_m intervals
+    initial_segment_len = max(min_segment_m, total_distance / 20)  # ~20 initial segments
     
+    boundaries = [0]
     for i in range(1, n_points):
-        point = course.points[i]
-        current_distance = point.distance_m - course.points[current_start].distance_m
-        
-        # Update running average
-        running_grade_sum += point.grade_pct
-        running_count += 1
-        running_avg_grade = running_grade_sum / running_count
-        
-        # Check for segment boundary
-        grade_diff = abs(point.grade_pct - running_avg_grade)
-        
-        should_split = False
-        
-        # Split on significant grade change (if minimum length reached)
-        if grade_diff > grade_change_threshold and current_distance >= min_segment_m:
-            should_split = True
-        
-        # Split if maximum length reached
-        if current_distance >= max_segment_m:
-            should_split = True
-        
-        if should_split:
+        dist_since_last = course.points[i].distance_m - course.points[boundaries[-1]].distance_m
+        if dist_since_last >= initial_segment_len:
             boundaries.append(i)
-            current_start = i
-            running_grade_sum = point.grade_pct
-            running_count = 1
+    boundaries.append(n_points)
     
-    # Add final boundary
-    if boundaries[-1] != n_points:
-        boundaries.append(n_points)
-    
-    # Merge very short segments at the end
-    while len(boundaries) > 2:
-        last_length = course.points[boundaries[-1] - 1].distance_m - course.points[boundaries[-2]].distance_m
-        if last_length < min_segment_m * 0.5:
-            boundaries.pop(-2)  # Remove second-to-last boundary
+    # Step 2: Iteratively merge the most similar adjacent segments
+    # until we reach target count
+    while len(boundaries) - 1 > target_segments:
+        # Find the pair with smallest power difference
+        best_merge_idx = None
+        best_merge_score = float('inf')
+        
+        for i in range(len(boundaries) - 2):
+            start1, end1 = boundaries[i], boundaries[i + 1]
+            start2, end2 = boundaries[i + 1], boundaries[i + 2]
+            
+            # Calculate average power for each segment
+            avg1 = np.mean(powers[start1:end1]) if end1 > start1 else 0
+            avg2 = np.mean(powers[start2:end2]) if end2 > start2 else 0
+            
+            # Score = power difference (lower = better merge candidate)
+            score = abs(avg1 - avg2)
+            
+            if score < best_merge_score:
+                best_merge_score = score
+                best_merge_idx = i + 1
+        
+        if best_merge_idx is not None:
+            boundaries.pop(best_merge_idx)
         else:
-            break
+            break  # Can't merge any more
     
-    # Create segments
+    # Step 3: Final pass - merge any adjacent segments with very similar power
+    # If powers are nearly identical, merge regardless of length - the goal is
+    # to give the rider ONE target for that section, not arbitrary splits
+    similarity_threshold = 0.03  # 3% = essentially the same power target
+    
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(boundaries) - 2:
+            start1, end1 = boundaries[i], boundaries[i + 1]
+            start2, end2 = boundaries[i + 1], boundaries[i + 2]
+            
+            avg1 = np.mean(powers[start1:end1]) if end1 > start1 else 0
+            avg2 = np.mean(powers[start2:end2]) if end2 > start2 else 0
+            avg_both = (avg1 + avg2) / 2
+            
+            # Check if very similar - if so, merge regardless of length
+            if avg_both > 0 and abs(avg1 - avg2) / avg_both < similarity_threshold:
+                boundaries.pop(i + 1)
+                changed = True
+                # Don't increment i - check the same position again with new neighbor
+                continue
+            i += 1
+    
+    # Step 4: Create final segments
     segments = []
     cumulative_time = 0.0
     
@@ -231,11 +254,12 @@ def auto_segment(
         start_idx = boundaries[i]
         end_idx = boundaries[i + 1]
         
-        segment = compute_segment_stats(
-            course, sim_result, start_idx, end_idx, i, cumulative_time
-        )
-        segments.append(segment)
-        cumulative_time = segment.cumulative_time_s
+        if end_idx > start_idx:
+            segment = compute_segment_stats(
+                course, sim_result, start_idx, end_idx, len(segments), cumulative_time
+            )
+            segments.append(segment)
+            cumulative_time = segment.cumulative_time_s
     
     return segments
 

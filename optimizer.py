@@ -28,13 +28,15 @@ class ProgressUpdate:
 @dataclass
 class OptimizationConfig:
     """Configuration for the optimizer."""
-    regularization: float = 0.1       # Penalty weight for power variability
-    pdc_penalty_weight: float = 1000.0  # Penalty weight for PDC violations
-    max_iterations: int = 500         # Maximum solver iterations
-    tolerance: float = 1e-6           # Convergence tolerance
+    regularization: float = 0.5       # Penalty weight for power variability (increased for smoother plans)
+    pdc_penalty_weight: float = 10000.0  # Penalty weight for PDC violations (10x higher)
+    max_iterations: int = 30          # Maximum solver iterations (most gains come very early)
+    tolerance: float = 1.0            # Convergence tolerance (1 second is plenty)
     initial_power_frac: float = 0.95  # Initial power as fraction of FTP
     verbose: bool = False
     progress_callback: Optional[Callable[[ProgressUpdate], None]] = None
+    early_stop_threshold: float = 3.0  # Stop if improvement < 3 seconds over recent evals
+    max_time_s: float = 30.0          # Maximum optimization time in seconds
 
 
 @dataclass 
@@ -58,37 +60,55 @@ class OptimizationResult:
         return self.baseline_simulation.total_time_s
 
 
+class EarlyStopException(Exception):
+    """Raised to terminate optimization early."""
+    pass
+
+
 class ObjectiveTracker:
-    """Tracks objective function evaluations for progress reporting."""
+    """Tracks objective function evaluations and enforces termination."""
     
     def __init__(self, opt_config: OptimizationConfig, baseline_time: float):
         self.opt_config = opt_config
         self.baseline_time = baseline_time
         self.iteration = 0
         self.best_time = float('inf')
+        self.best_x = None
         self.start_time = time.time()
         self.last_report_time = 0
+        self.last_improvement_time = time.time()
         self.eval_count = 0
+        self.stop_reason = ""
     
-    def report(self, total_time: float, objective_value: float):
-        """Report progress if callback is set."""
-        self.eval_count += 1
+    def check_and_report(self, power_array: np.ndarray, total_time: float, objective_value: float):
+        """
+        Check termination conditions and report progress.
         
-        # Only report every ~20 evaluations or if significant improvement
+        Raises EarlyStopException if we should terminate.
+        """
+        self.eval_count += 1
         current_time = time.time()
-        time_since_report = current_time - self.last_report_time
+        elapsed = current_time - self.start_time
+        
+        # Check for significant improvement (> 0.5 seconds)
         improved = total_time < self.best_time - 0.5
         
         if improved:
             self.best_time = total_time
+            self.best_x = power_array.copy()
+            self.last_improvement_time = current_time
+        elif self.best_x is None:
+            # Store first result even if not "improved"
+            self.best_x = power_array.copy()
+            self.best_time = total_time
         
         # Report every 2 seconds or on improvement
+        time_since_report = current_time - self.last_report_time
         if self.opt_config.progress_callback and (time_since_report > 2.0 or improved):
             self.last_report_time = current_time
             self.iteration += 1
             
             improvement = self.baseline_time - self.best_time
-            elapsed = current_time - self.start_time
             
             update = ProgressUpdate(
                 iteration=self.iteration,
@@ -96,9 +116,22 @@ class ObjectiveTracker:
                 objective_value=objective_value,
                 improvement_s=improvement,
                 elapsed_s=elapsed,
-                message=f"Eval #{self.eval_count}: Best time {self.best_time:.1f}s (saving {improvement:.1f}s)"
+                message=f"Best: {self.best_time:.1f}s (saving {improvement:.1f}s) - {elapsed:.0f}s elapsed"
             )
             self.opt_config.progress_callback(update)
+        
+        # === TERMINATION CHECKS ===
+        time_since_improvement = current_time - self.last_improvement_time
+        
+        # Stop if exceeded max time
+        if elapsed > self.opt_config.max_time_s:
+            self.stop_reason = f"Max time ({self.opt_config.max_time_s:.0f}s) reached"
+            raise EarlyStopException(self.stop_reason)
+        
+        # Stop if no improvement for 10 seconds (after initial settling)
+        if time_since_improvement > 10.0 and elapsed > 5.0:
+            self.stop_reason = f"No improvement for {time_since_improvement:.0f}s"
+            raise EarlyStopException(self.stop_reason)
 
 
 def create_objective_function(
@@ -117,13 +150,16 @@ def create_objective_function(
     - Plus regularization penalty for power variability
     - Plus soft penalty for PDC violations
     
+    This function also checks termination conditions via the tracker,
+    which will raise EarlyStopException when it's time to stop.
+    
     Args:
         course: Course to optimize
         weather: Weather conditions
         physics_config: Physics parameters
         pdc: Power duration curve
         opt_config: Optimization configuration
-        tracker: Optional progress tracker
+        tracker: Progress tracker (also handles termination)
         
     Returns:
         Objective function that takes power array and returns scalar cost
@@ -148,9 +184,9 @@ def create_objective_function(
         
         obj_value = total_time + smoothness_penalty + pdc_penalty
         
-        # Report progress
+        # Check termination and report progress (may raise EarlyStopException)
         if tracker:
-            tracker.report(total_time, obj_value)
+            tracker.check_and_report(power_array, total_time, obj_value)
         
         return obj_value
     
@@ -166,6 +202,9 @@ def create_bounds(
     """
     Create power bounds for optimization.
     
+    Individual segments can spike above race-duration power (that's the point of
+    variable pacing), but the PDC penalty will ensure NP stays within limits.
+    
     Args:
         n_segments: Number of segments
         pdc: Power duration curve
@@ -177,12 +216,9 @@ def create_bounds(
     """
     p_min = physics_config.p_min
     
-    # Upper bound: maximum power for expected duration
-    # Use slightly shorter duration to allow some margin
-    p_max = pdc.max_power(max(60, expected_duration_s * 0.8))
-    
-    # Allow higher power for short bursts
-    p_max = min(p_max * 1.2, pdc.max_power(60))
+    # Upper bound: allow spikes up to ~5-minute power for short climbs
+    # The PDC penalty ensures overall NP stays within race-duration limits
+    p_max = pdc.max_power(300)  # 5-minute power as upper bound for any segment
     
     lower = np.full(n_segments, p_min)
     upper = np.full(n_segments, p_max)
@@ -262,16 +298,15 @@ def optimize_pacing(
     )
     log(f"  Initial estimate: {initial_duration:.1f}s ({initial_duration/60:.1f} min)")
     
-    # Step 2: Create baseline (constant power) simulation
-    log("Step 2/7: Running baseline simulation...")
-    baseline_power = ftp * opt_config.initial_power_frac
+    # Step 2: Initial estimate for optimization setup
+    log("Step 2/7: Setting up initial power estimate...")
     from physics import simulate_constant_power
-    baseline_sim = simulate_constant_power(course, baseline_power, weather, physics_config)
-    log(f"  Baseline at {baseline_power:.0f}W: {baseline_sim.total_time_s:.1f}s ({baseline_sim.total_time_s/60:.1f} min)")
+    initial_power_level = pdc.max_power(initial_duration) * 0.95
+    log(f"  Starting optimization from {initial_power_level:.0f}W")
     
     # Step 3: Initialize power array
     log("Step 3/7: Initializing power array with grade adjustments...")
-    initial_power = np.full(n_segments, baseline_power)
+    initial_power = np.full(n_segments, initial_power_level)
     
     # Apply grade-based initial adjustments
     grades = course.get_grades()
@@ -283,8 +318,9 @@ def optimize_pacing(
     # Step 4: Create objective function and bounds
     log("Step 4/7: Setting up optimizer...")
     
-    # Create tracker for progress updates
-    tracker = ObjectiveTracker(opt_config, baseline_sim.total_time_s)
+    # Create tracker for progress updates (use initial estimate as reference)
+    initial_sim = simulate_constant_power(course, initial_power_level, weather, physics_config)
+    tracker = ObjectiveTracker(opt_config, initial_sim.total_time_s)
     
     objective = create_objective_function(
         course, weather, physics_config, pdc, opt_config, tracker
@@ -298,28 +334,38 @@ def optimize_pacing(
     
     # Step 5: Run optimization
     log("Step 5/7: Running L-BFGS-B optimization...")
-    log("  (This may take a minute for long courses)")
+    log(f"  Max iterations: {opt_config.max_iterations}, tolerance: {opt_config.tolerance}s")
+    log(f"  Max time: {opt_config.max_time_s:.0f}s, early stop if no improvement for 10s")
     
     start_time = time.time()
     
     options = {
         'maxiter': opt_config.max_iterations,
-        'ftol': opt_config.tolerance,
+        'ftol': 1e-6,  # Use tight tolerance; we control stopping via time/improvement
     }
     
-    result = minimize(
-        objective,
-        initial_power,
-        method='L-BFGS-B',
-        bounds=bounds,
-        options=options
-    )
+    n_iterations = 0
+    try:
+        result = minimize(
+            objective,
+            initial_power,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options=options
+        )
+        optimized_power = result.x
+        converged = result.success
+        n_iterations = result.nit
+        log(f"  Optimizer converged naturally after {n_iterations} iterations")
+    except EarlyStopException as e:
+        # Early stopping triggered - use best solution found
+        optimized_power = tracker.best_x if tracker.best_x is not None else initial_power
+        converged = True  # We stopped intentionally
+        n_iterations = tracker.eval_count
+        log(f"  Early stop: {e}")
     
     opt_elapsed = time.time() - start_time
-    log(f"  Optimization completed in {opt_elapsed:.1f}s")
-    log(f"  Converged: {result.success}, Iterations: {result.nit}")
-    
-    optimized_power = result.x
+    log(f"  Completed in {opt_elapsed:.1f}s after {tracker.eval_count} evaluations")
     
     # Step 6: Apply smoothing
     log("Step 6/7: Smoothing power profile...")
@@ -343,13 +389,20 @@ def optimize_pacing(
         pdc
     )
     
+    # Calculate baseline: what if you held the optimized NP as constant power?
+    # This is the fair comparison - same physiological cost, but constant vs variable pacing
+    optimized_np = final_sim.normalized_power_w
+    baseline_sim = simulate_constant_power(course, optimized_np, weather, physics_config)
+    
     time_saved = baseline_sim.total_time_s - final_sim.total_time_s
-    time_saved_pct = (time_saved / baseline_sim.total_time_s) * 100
+    time_saved_pct = (time_saved / baseline_sim.total_time_s) * 100 if baseline_sim.total_time_s > 0 else 0
     
     log(f"")
     log(f"=== OPTIMIZATION COMPLETE ===")
     log(f"  Optimized time: {final_sim.total_time_s:.1f}s ({final_sim.total_time_s/60:.1f} min)")
-    log(f"  Time saved: {time_saved:.1f}s ({time_saved_pct:.1f}%)")
+    log(f"  Avg power: {final_sim.avg_power_w:.0f}W, NP: {optimized_np:.0f}W")
+    log(f"  Baseline (constant {optimized_np:.0f}W): {baseline_sim.total_time_s:.1f}s")
+    log(f"  Time saved by variable pacing: {time_saved:.1f}s ({time_saved_pct:.1f}%)")
     log(f"  PDC violations: {len(violations)}")
     
     return OptimizationResult(
@@ -358,8 +411,8 @@ def optimize_pacing(
         baseline_simulation=baseline_sim,
         time_saved_s=time_saved,
         time_saved_pct=time_saved_pct,
-        iterations=result.nit,
-        converged=result.success,
+        iterations=n_iterations,
+        converged=converged,
         violations=violations
     )
 

@@ -256,6 +256,169 @@ def create_elevation_profile(
     return fig
 
 
+def create_segment_overlay_chart(
+    course: Course,
+    sim_result: SimulationResult,
+    segments: List[Segment],
+    title: str = "Pacing Plan Overview"
+) -> go.Figure:
+    """
+    Create elevation profile with segment power targets overlaid as rectangles.
+    
+    Shows:
+    - Elevation profile as background (filled area)
+    - Grade coloring on the elevation
+    - Segment power targets as semi-transparent rectangles
+    
+    Args:
+        course: Course data
+        sim_result: Simulation result
+        segments: Segment list with power targets
+        title: Plot title
+        
+    Returns:
+        Plotly Figure with dual y-axes (elevation left, power right)
+    """
+    distances_km = course.get_distances() / 1000
+    elevations = course.get_elevations()
+    grades = course.get_grades()
+    
+    # Create figure with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Color elevation by grade
+    # Create segments of elevation colored by grade
+    n_points = len(distances_km)
+    
+    # Add elevation profile as filled area
+    fig.add_trace(
+        go.Scatter(
+            x=distances_km,
+            y=elevations,
+            mode='lines',
+            name='Elevation',
+            line=dict(color='#795548', width=1),
+            fill='tozeroy',
+            fillcolor='rgba(121, 85, 72, 0.2)',
+            hovertemplate='%{x:.2f} km<br>%{y:.0f} m<extra>Elevation</extra>'
+        ),
+        secondary_y=False
+    )
+    
+    # Add grade coloring as scatter points on the elevation line
+    # Color: green (descent) -> yellow (flat) -> red (steep climb)
+    grade_colors = []
+    for g in grades:
+        if g < -2:
+            grade_colors.append('#4CAF50')  # Green - descent
+        elif g < 2:
+            grade_colors.append('#FFC107')  # Yellow - flat
+        elif g < 6:
+            grade_colors.append('#FF9800')  # Orange - moderate
+        else:
+            grade_colors.append('#F44336')  # Red - steep
+    
+    fig.add_trace(
+        go.Scatter(
+            x=distances_km,
+            y=elevations,
+            mode='markers',
+            name='Grade',
+            marker=dict(
+                color=grade_colors,
+                size=3,
+                opacity=0.7
+            ),
+            hovertemplate='%{x:.2f} km<br>Grade: %{text}%<extra></extra>',
+            text=[f'{g:.1f}' for g in grades],
+            showlegend=False
+        ),
+        secondary_y=False
+    )
+    
+    # Add segment power rectangles on secondary y-axis
+    if segments:
+        # Get power range for scaling
+        all_powers = [seg.avg_power for seg in segments]
+        min_power = min(all_powers) * 0.9
+        max_power = max(all_powers) * 1.1
+        
+        # Color palette for segments (alternating for clarity)
+        colors = [
+            'rgba(33, 150, 243, 0.4)',   # Blue
+            'rgba(76, 175, 80, 0.4)',    # Green  
+            'rgba(255, 152, 0, 0.4)',    # Orange
+            'rgba(156, 39, 176, 0.4)',   # Purple
+            'rgba(0, 188, 212, 0.4)',    # Cyan
+            'rgba(255, 87, 34, 0.4)',    # Deep Orange
+            'rgba(103, 58, 183, 0.4)',   # Deep Purple
+            'rgba(0, 150, 136, 0.4)',    # Teal
+        ]
+        
+        for i, seg in enumerate(segments):
+            color = colors[i % len(colors)]
+            border_color = color.replace('0.4)', '0.8)')
+            
+            start_km = seg.start_m / 1000
+            end_km = seg.end_m / 1000
+            
+            # Add rectangle for this segment
+            fig.add_shape(
+                type="rect",
+                x0=start_km,
+                x1=end_km,
+                y0=min_power,
+                y1=seg.avg_power,
+                fillcolor=color,
+                line=dict(color=border_color, width=2),
+                layer="above",
+                yref="y2"
+            )
+            
+            # Add power label at top of rectangle
+            fig.add_annotation(
+                x=(start_km + end_km) / 2,
+                y=seg.avg_power,
+                yref="y2",
+                text=f"<b>{seg.avg_power:.0f}W</b>",
+                showarrow=False,
+                font=dict(size=11, color='white'),
+                bgcolor=border_color,
+                borderpad=3
+            )
+            
+            # Add segment number at bottom
+            fig.add_annotation(
+                x=(start_km + end_km) / 2,
+                y=min_power,
+                yref="y2",
+                text=f"Seg {seg.index + 1}",
+                showarrow=False,
+                font=dict(size=9),
+                yshift=10
+            )
+    
+    # Update layout
+    fig.update_layout(
+        title=title,
+        height=450,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        hovermode='x unified'
+    )
+    
+    # Update axes
+    fig.update_xaxes(title_text="Distance (km)")
+    fig.update_yaxes(title_text="Elevation (m)", secondary_y=False)
+    fig.update_yaxes(
+        title_text="Target Power (W)", 
+        secondary_y=True,
+        range=[min_power * 0.95, max_power] if segments else None
+    )
+    
+    return fig
+
+
 def create_splits_chart(
     segments: List[Segment],
     title: str = "Segment Times"

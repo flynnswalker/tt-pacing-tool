@@ -75,6 +75,72 @@ class SimulationResult:
     
     def get_distances(self) -> np.ndarray:
         return np.array([p.distance_m for p in self.points])
+    
+    @property
+    def normalized_power_w(self) -> float:
+        """
+        Calculate Normalized Power (NP).
+        
+        NP = 4th root of average of (30-second rolling average power)^4
+        This accounts for the physiological cost of power variability.
+        """
+        powers = self.get_powers()
+        times = self.get_times()
+        
+        if len(powers) < 2:
+            return self.avg_power_w
+        
+        # Calculate time-weighted 30-second rolling average
+        window_s = 30.0
+        rolling_powers = []
+        
+        for i in range(len(powers)):
+            current_time = times[i]
+            start_time = max(0, current_time - window_s)
+            
+            # Find points within window
+            mask = (times >= start_time) & (times <= current_time)
+            if np.any(mask):
+                window_powers = powers[mask]
+                window_times = times[mask]
+                
+                if len(window_powers) > 1:
+                    # Time-weighted average
+                    time_deltas = np.diff(window_times)
+                    if np.sum(time_deltas) > 0:
+                        mid_powers = (window_powers[:-1] + window_powers[1:]) / 2
+                        avg = np.sum(mid_powers * time_deltas) / np.sum(time_deltas)
+                    else:
+                        avg = np.mean(window_powers)
+                else:
+                    avg = window_powers[0]
+                rolling_powers.append(avg)
+            else:
+                rolling_powers.append(powers[i])
+        
+        rolling_powers = np.array(rolling_powers)
+        
+        # NP = 4th root of mean of 4th powers
+        return (np.mean(rolling_powers ** 4)) ** 0.25
+    
+    @property
+    def intensity_factor(self) -> float:
+        """
+        Calculate Intensity Factor (IF) relative to FTP.
+        Assumes FTP is ~95% of 60-min power, approximated as avg_power for hour-long efforts.
+        """
+        # Can't calculate without knowing FTP, so return NP/avg ratio
+        return self.normalized_power_w / self.avg_power_w if self.avg_power_w > 0 else 1.0
+    
+    @property
+    def variability_index(self) -> float:
+        """
+        Calculate Variability Index (VI = NP / Avg Power).
+        
+        VI of 1.0 means perfectly steady power.
+        Higher values indicate more variable pacing.
+        """
+        return self.normalized_power_w / self.avg_power_w if self.avg_power_w > 0 else 1.0
 
 
 def get_cda(

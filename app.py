@@ -23,8 +23,11 @@ from segmentation import auto_segment, split_segment_at_distance, merge_segments
 from reporting import (
     create_power_plot, create_speed_plot, create_elevation_profile,
     create_splits_chart, create_comparison_plot, segments_to_dataframe,
-    generate_race_guidance, format_race_card, export_plan_csv
+    generate_race_guidance, format_race_card, export_plan_csv,
+    create_segment_overlay_chart
 )
+import json
+import os
 
 
 # Page configuration
@@ -48,6 +51,53 @@ def init_session_state():
         st.session_state.optimization_result = None
     if 'segments' not in st.session_state:
         st.session_state.segments = None
+    if 'loaded_profile' not in st.session_state:
+        st.session_state.loaded_profile = None
+
+
+def get_sample_courses() -> dict:
+    """
+    Scan sample_data/ folder for GPX files.
+    
+    Users can add their own real GPX files to this folder and they'll
+    appear in the dropdown. Download from Strava, RideWithGPS, etc.
+    """
+    sample_dir = "sample_data"
+    courses = {}
+    
+    if os.path.exists(sample_dir):
+        for filename in sorted(os.listdir(sample_dir)):
+            if filename.lower().endswith('.gpx'):
+                # Create a friendly name from filename
+                name = filename[:-4].replace('_', ' ').replace('-', ' ').title()
+                courses[name] = os.path.join(sample_dir, filename)
+    
+    return courses
+
+
+def get_sample_gpx(filepath: str) -> str:
+    """Load a GPX file content."""
+    if filepath and os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            return f.read()
+    return None
+
+
+def create_user_profile(rider: dict, anchors: dict, equipment: dict, environment: dict, advanced: dict) -> dict:
+    """Create a user profile dictionary from current settings."""
+    return {
+        "version": 1,
+        "rider": rider,
+        "anchors": anchors,
+        "equipment": equipment,
+        "environment": {k: v for k, v in environment.items() if k != 'race_datetime'},
+        "advanced": advanced
+    }
+
+
+def profile_to_json(profile: dict) -> str:
+    """Convert profile to JSON string."""
+    return json.dumps(profile, indent=2)
 
 
 def format_time(seconds: float) -> str:
@@ -67,41 +117,61 @@ def sidebar_rider_params() -> dict:
     """Render rider parameters in sidebar."""
     st.sidebar.header("Rider Parameters")
     
-    mass = st.sidebar.number_input(
-        "Total Mass (kg)",
-        min_value=50.0,
-        max_value=150.0,
-        value=75.0,
-        step=0.5,
-        help="Rider + bike + gear"
-    )
+    col1, col2 = st.sidebar.columns(2)
+    
+    with col1:
+        rider_weight = st.number_input(
+            "Rider (kg)",
+            min_value=40.0,
+            max_value=150.0,
+            value=80.0,
+            step=0.5,
+            help="Your body weight"
+        )
+    
+    with col2:
+        bike_weight = st.number_input(
+            "Bike+Gear (kg)",
+            min_value=5.0,
+            max_value=20.0,
+            value=8.0,
+            step=0.5,
+            help="Bike, shoes, helmet, bottles, etc."
+        )
+    
+    total_mass = rider_weight + bike_weight
+    st.sidebar.caption(f"Total system mass: {total_mass:.1f} kg")
     
     ftp = st.sidebar.number_input(
         "FTP (W)",
         min_value=100,
         max_value=500,
-        value=250,
+        value=350,
         step=5,
         help="Functional Threshold Power"
     )
+    
+    # Show W/kg
+    w_per_kg = ftp / rider_weight
+    st.sidebar.caption(f"FTP: {w_per_kg:.2f} W/kg")
     
     hr_max = st.sidebar.number_input(
         "Max HR",
         min_value=150,
         max_value=220,
-        value=185,
+        value=195,
         step=1,
         help="Maximum heart rate"
     )
     
-    return {'mass': mass, 'ftp': ftp, 'hr_max': hr_max}
+    return {'mass': total_mass, 'rider_weight': rider_weight, 'bike_weight': bike_weight, 'ftp': ftp, 'hr_max': hr_max}
 
 
 def sidebar_power_anchors(ftp: float) -> dict:
     """Render power anchor inputs in sidebar."""
     st.sidebar.header("Power Anchors")
     
-    use_defaults = st.sidebar.checkbox("Use defaults from FTP", value=True)
+    use_defaults = st.sidebar.checkbox("Use defaults from FTP", value=False)
     
     if use_defaults:
         anchors = default_anchors_from_ftp(ftp)
@@ -111,13 +181,13 @@ def sidebar_power_anchors(ftp: float) -> dict:
         col1, col2 = st.sidebar.columns(2)
         
         with col1:
-            p5s = st.number_input("5s", min_value=100, max_value=2000, value=int(ftp*2.5))
-            p1m = st.number_input("1m", min_value=100, max_value=1500, value=int(ftp*1.5))
-            p5m = st.number_input("5m", min_value=100, max_value=800, value=int(ftp*1.15))
+            p5s = st.number_input("5s", min_value=100, max_value=2000, value=1300)
+            p1m = st.number_input("1m", min_value=100, max_value=1500, value=585)
+            p5m = st.number_input("5m", min_value=100, max_value=800, value=415)
         
         with col2:
-            p20m = st.number_input("20m", min_value=100, max_value=600, value=int(ftp*1.02))
-            p60m = st.number_input("60m", min_value=100, max_value=500, value=int(ftp*0.95))
+            p20m = st.number_input("20m", min_value=100, max_value=600, value=357)
+            p60m = st.number_input("60m", min_value=100, max_value=500, value=337)
         
         anchors = {5: p5s, 60: p1m, 300: p5m, 1200: p20m, 3600: p60m}
     
@@ -144,7 +214,7 @@ def sidebar_equipment() -> dict:
             "CdA Flat (m²)",
             min_value=0.15,
             max_value=0.40,
-            value=0.25,
+            value=0.26,
             step=0.01,
             help="Drag area in TT position"
         )
@@ -162,7 +232,7 @@ def sidebar_equipment() -> dict:
             "Grade Threshold (%)",
             min_value=0.0,
             max_value=15.0,
-            value=6.0,
+            value=5.0,
             step=0.5,
             help="Switch to climb CdA above this grade"
         )
@@ -181,8 +251,8 @@ def sidebar_equipment() -> dict:
             "Crr",
             min_value=0.002,
             max_value=0.010,
-            value=0.004,
-            step=0.0005,
+            value=0.0029,
+            step=0.0001,
             format="%.4f",
             help="Rolling resistance coefficient"
         )
@@ -200,12 +270,26 @@ def sidebar_environment() -> dict:
     """Render environment settings in sidebar."""
     st.sidebar.header("Environment")
     
-    use_forecast = st.sidebar.checkbox("Fetch weather forecast", value=False)
+    use_forecast = st.sidebar.checkbox(
+        "Fetch weather forecast", 
+        value=False,
+        help="Only works for dates within ~14 days. For future races, use manual weather."
+    )
     
     if use_forecast:
-        race_date = st.sidebar.date_input("Race Date", value=datetime.now().date())
-        race_time = st.sidebar.time_input("Start Time", value=datetime.now().time())
+        # Default to a realistic near-future date
+        default_date = datetime(2026, 5, 16).date()
+        race_date = st.sidebar.date_input("Race Date", value=default_date)
+        race_time = st.sidebar.time_input("Start Time", value=datetime.strptime("09:15", "%H:%M").time())
         race_datetime = datetime.combine(race_date, race_time)
+        
+        # Warn if date is too far out
+        days_out = (race_date - datetime.now().date()).days
+        if days_out > 14:
+            st.sidebar.warning(
+                f"⚠️ Race is {days_out} days away. Weather forecasts are only reliable "
+                f"for ~14 days. Consider using manual weather settings."
+            )
         
         return {
             'use_forecast': True,
@@ -245,10 +329,10 @@ def sidebar_advanced() -> dict:
         regularization = st.slider(
             "Pacing Smoothness",
             min_value=0.01,
-            max_value=1.0,
-            value=0.1,
-            step=0.01,
-            help="Higher = smoother power changes"
+            max_value=2.0,
+            value=0.5,
+            step=0.05,
+            help="Higher = smoother power changes (less variation between segments)"
         )
         
         grade_seg_threshold = st.number_input(
@@ -262,17 +346,27 @@ def sidebar_advanced() -> dict:
         
         min_segment_m = st.number_input(
             "Min Segment Length (m)",
-            min_value=200,
+            min_value=100,
             max_value=2000,
             value=500,
             step=100
+        )
+        
+        target_segments = st.number_input(
+            "Target # of Segments",
+            min_value=3,
+            max_value=15,
+            value=6,
+            step=1,
+            help="Aim for this many segments (easier to memorize)"
         )
     
     return {
         'smoothing_window': smoothing_window,
         'regularization': regularization,
         'grade_seg_threshold': grade_seg_threshold,
-        'min_segment_m': min_segment_m
+        'min_segment_m': min_segment_m,
+        'target_segments': target_segments
     }
 
 
@@ -330,23 +424,53 @@ def render_plan_tab(result: OptimizationResult, course: Course):
     """Render the Plan tab content."""
     st.subheader("Optimized Pacing Plan")
     
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
+    # Summary metrics - row 1
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.metric("Predicted Time", format_time(result.total_time_s))
     with col2:
-        st.metric("Baseline Time", format_time(result.baseline_time_s))
+        np_val = result.simulation.normalized_power_w
+        st.metric(
+            "Baseline Time", 
+            format_time(result.baseline_time_s),
+            help=f"Time if you held constant {np_val:.0f}W (same NP as optimized plan). The difference shows the benefit of varying power with terrain."
+        )
     with col3:
         st.metric("Time Saved", f"{result.time_saved_s:.1f}s ({result.time_saved_pct:.1f}%)")
     with col4:
         st.metric("Avg Power", f"{result.simulation.avg_power_w:.0f} W")
+    with col5:
+        np_val = result.simulation.normalized_power_w
+        vi = result.simulation.variability_index
+        st.metric(
+            "Normalized Power", 
+            f"{np_val:.0f} W",
+            delta=f"VI: {vi:.2f}",
+            delta_color="off",
+            help="NP accounts for the higher physiological cost of variable power. VI (Variability Index) = NP/Avg. VI close to 1.0 means steady pacing."
+        )
     
-    # Violations warning
+    # Violations warning with explanation
     if result.violations:
         st.warning(format_violations(result.violations))
+        with st.expander("What are PDC violations?"):
+            st.markdown("""
+            **PDC (Power Duration Curve) violations** occur when the optimized plan exceeds what you can 
+            physiologically sustain based on your power anchors.
+            
+            For example, if your 20-minute max is 357W, but the plan asks you to average 370W over any 
+            20-minute window, that's a violation.
+            
+            **Minor violations (1-5%)** may be acceptable if you're willing to dig deeper than your 
+            known limits. **Large violations (>10%)** indicate the plan is unrealistic and you should 
+            either adjust your expectations or improve your fitness data.
+            
+            The optimizer tries to avoid violations but may accept small ones if it significantly 
+            improves time.
+            """)
     else:
-        st.success("Plan respects all PDC limits")
+        st.success("Plan respects all PDC limits - this effort is physiologically achievable based on your power data")
     
     # Power plot
     st.subheader("Power Profile")
@@ -376,7 +500,8 @@ def render_segments_tab(course: Course, result: OptimizationResult, advanced: di
             st.session_state.segments = auto_segment(
                 course, result.simulation,
                 grade_change_threshold=advanced['grade_seg_threshold'],
-                min_segment_m=advanced['min_segment_m']
+                min_segment_m=advanced['min_segment_m'],
+                target_segments=advanced['target_segments']
             )
             st.rerun()
     
@@ -386,7 +511,13 @@ def render_segments_tab(course: Course, result: OptimizationResult, advanced: di
         st.info("Click 'Re-segment Course' to generate segments")
         return
     
+    # Segment overlay visualization - the main view
+    st.subheader("Pacing Plan Overview")
+    fig = create_segment_overlay_chart(course, result.simulation, segments)
+    st.plotly_chart(fig, use_container_width=True)
+    
     # Segment table
+    st.subheader("Segment Details")
     df = segments_to_dataframe(segments)
     st.dataframe(df, use_container_width=True, hide_index=True)
     
@@ -514,7 +645,32 @@ def main():
     
     # GPX upload
     st.sidebar.header("Course")
-    uploaded_gpx = st.sidebar.file_uploader("Load GPX File", type=['gpx'])
+    
+    # Sample courses dropdown - scans sample_data/ folder
+    sample_courses = get_sample_courses()
+    
+    if sample_courses:
+        sample_options = ["-- Select Sample --"] + list(sample_courses.keys())
+        selected_sample = st.sidebar.selectbox("Load Sample Course", sample_options, key="sample_course")
+        
+        if selected_sample != "-- Select Sample --":
+            gpx_content = get_sample_gpx(sample_courses[selected_sample])
+            if gpx_content:
+                try:
+                    course = load_course_from_string(
+                        gpx_content,
+                        step_m=50.0,
+                        smoothing_window=advanced['smoothing_window']
+                    )
+                    st.session_state.course = course
+                    st.sidebar.success(f"Loaded sample: {course.total_distance_m/1000:.1f} km")
+                except Exception as e:
+                    st.sidebar.error(f"Error loading sample: {e}")
+    else:
+        st.sidebar.caption("Add .gpx files to sample_data/ folder to see them here")
+    
+    # Or upload custom GPX
+    uploaded_gpx = st.sidebar.file_uploader("Or Upload GPX File", type=['gpx'])
     
     if uploaded_gpx:
         try:
@@ -531,6 +687,37 @@ def main():
     
     # Generate button
     generate_clicked = st.sidebar.button("Generate Plan", type="primary", use_container_width=True)
+    
+    # Profile save/load
+    st.sidebar.header("User Profile")
+    
+    with st.sidebar.expander("Save/Load Profile", expanded=False):
+        st.caption("Save your settings to quickly reload later")
+        
+        # Save profile
+        current_profile = create_user_profile(rider, anchors, equipment, environment, advanced)
+        profile_json = profile_to_json(current_profile)
+        
+        st.download_button(
+            "Download Profile",
+            profile_json,
+            file_name="tt_pacing_profile.json",
+            mime="application/json",
+            use_container_width=True
+        )
+        
+        # Load profile
+        uploaded_profile = st.file_uploader("Load Profile", type=['json'], key='profile_upload')
+        if uploaded_profile:
+            try:
+                profile_data = json.loads(uploaded_profile.read().decode('utf-8'))
+                st.session_state.loaded_profile = profile_data
+                st.success("Profile loaded! Refresh page to apply.")
+                st.info("Settings from profile: " + 
+                       f"Mass={profile_data.get('rider', {}).get('mass', '?')}kg, " +
+                       f"FTP={profile_data.get('rider', {}).get('ftp', '?')}W")
+            except Exception as e:
+                st.error(f"Error loading profile: {e}")
     
     if generate_clicked and st.session_state.course is not None:
         course = st.session_state.course
@@ -634,7 +821,8 @@ def main():
             segments = auto_segment(
                 course, result.simulation,
                 grade_change_threshold=advanced['grade_seg_threshold'],
-                min_segment_m=advanced['min_segment_m']
+                min_segment_m=advanced['min_segment_m'],
+                target_segments=advanced['target_segments']
             )
             st.session_state.segments = segments
             log_callback(f"  Created {len(segments)} segments")

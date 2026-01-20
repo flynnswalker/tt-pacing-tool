@@ -13,9 +13,9 @@ import io
 
 @dataclass
 class Violation:
-    """Represents a PDC violation."""
+    """Represents a PDC violation based on Normalized Power."""
     window_s: int           # Duration window that was exceeded
-    actual_power: float     # Actual rolling average power
+    actual_power: float     # Actual NP over this window
     max_allowed: float      # Maximum allowed per PDC
     excess_pct: float       # Percentage over limit
     
@@ -37,7 +37,8 @@ class PDCModel:
         """
         Get maximum sustainable power for a given duration.
         
-        Uses extended CP model: P(t) = CP + W'/t + (Pmax - CP) * exp(-t/tau)
+        Uses interpolation between anchor points for accuracy, with 
+        model-based extrapolation only outside anchor range.
         
         Args:
             duration_s: Duration in seconds
@@ -45,6 +46,48 @@ class PDCModel:
         Returns:
             Maximum power in Watts
         """
+        if duration_s <= 0:
+            return self.p_max
+        
+        # If we have anchor points, interpolate between them for accuracy
+        if self.anchors and len(self.anchors) >= 2:
+            anchor_durations = sorted(self.anchors.keys())
+            anchor_powers = [self.anchors[d] for d in anchor_durations]
+            
+            # If within anchor range, interpolate
+            if anchor_durations[0] <= duration_s <= anchor_durations[-1]:
+                # Find surrounding anchors
+                for i in range(len(anchor_durations) - 1):
+                    if anchor_durations[i] <= duration_s <= anchor_durations[i + 1]:
+                        d1, d2 = anchor_durations[i], anchor_durations[i + 1]
+                        p1, p2 = anchor_powers[i], anchor_powers[i + 1]
+                        
+                        # Log-linear interpolation (power vs log(duration))
+                        log_d1, log_d2, log_d = math.log(d1), math.log(d2), math.log(duration_s)
+                        t = (log_d - log_d1) / (log_d2 - log_d1)
+                        return p1 + t * (p2 - p1)
+            
+            # Below shortest anchor - use model
+            if duration_s < anchor_durations[0]:
+                # Use model but cap at shortest anchor extrapolated
+                model_power = self._model_power(duration_s)
+                return min(model_power, self.p_max)
+            
+            # Above longest anchor - extrapolate conservatively
+            if duration_s > anchor_durations[-1]:
+                # Use the last anchor as base and decay slowly
+                last_power = anchor_powers[-1]
+                last_dur = anchor_durations[-1]
+                # Assume ~5% drop per doubling of time
+                ratio = duration_s / last_dur
+                decay = 0.95 ** (math.log2(ratio))
+                return last_power * decay
+        
+        # Fallback to model
+        return self._model_power(duration_s)
+    
+    def _model_power(self, duration_s: float) -> float:
+        """Calculate power using the extended CP model formula."""
         if duration_s <= 0:
             return self.p_max
         
@@ -118,6 +161,9 @@ def fit_pdc(anchors: Dict[int, float], model_type: str = 'extended') -> PDCModel
     """
     Fit a power-duration curve to anchor points.
     
+    The model prioritizes matching longer duration anchors since those are 
+    most critical for pacing validation.
+    
     Args:
         anchors: Dictionary mapping duration_seconds -> power_watts
         model_type: 'extended' (4-param) or 'simple' (2-param)
@@ -137,21 +183,27 @@ def fit_pdc(anchors: Dict[int, float], model_type: str = 'extended') -> PDCModel
     durations = durations[sort_idx]
     powers = powers[sort_idx]
     
+    # For accurate pacing, we MUST respect the longer duration anchors
+    # Use a weighted fit that prioritizes longer durations
+    # Weight by log of duration so 3600s is weighted 3x more than 60s
+    weights = np.log10(durations + 1)
+    weights = weights / weights.sum() * len(weights)  # Normalize
+    
     # Initial estimates
-    # CP: approximately the longest duration power
-    cp_init = min(powers)
+    # CP: use the longest duration power as a more accurate starting point
+    cp_init = powers[-1]  # Longest duration power
     
     # W': estimate from short duration excess over CP
     w_prime_init = (powers[0] - cp_init) * durations[0]
     
     # Pmax: highest power (usually shortest duration)
-    p_max_init = max(powers) * 1.2
+    p_max_init = max(powers) * 1.1
     
     # Tau: time constant (typically 10-30s)
     tau_init = 15.0
     
     if model_type == 'simple' or len(anchors) < 4:
-        # Fit simple 2-parameter model
+        # Fit simple 2-parameter model with weights
         try:
             popt, _ = curve_fit(
                 simple_cp_model,
@@ -159,25 +211,26 @@ def fit_pdc(anchors: Dict[int, float], model_type: str = 'extended') -> PDCModel
                 powers,
                 p0=[cp_init, w_prime_init],
                 bounds=([50, 1000], [500, 50000]),
+                sigma=1/weights,  # Higher weight = lower sigma
                 maxfev=5000
             )
             cp, w_prime = popt
             
             # Estimate p_max and tau from data
             if 5 in anchors:
-                p_max = anchors[5] * 1.1
+                p_max = anchors[5] * 1.05
             else:
-                p_max = powers[0] * 1.2
+                p_max = powers[0] * 1.1
             tau = 20.0
             
         except Exception:
             # Fallback to manual calculation
-            cp = min(powers)
-            w_prime = (max(powers) - cp) * min(durations)
-            p_max = max(powers) * 1.2
+            cp = powers[-1]  # Use longest duration
+            w_prime = (powers[0] - cp) * durations[0]
+            p_max = max(powers) * 1.1
             tau = 20.0
     else:
-        # Fit extended 4-parameter model
+        # Fit extended 4-parameter model with weights
         try:
             popt, _ = curve_fit(
                 extended_cp_model,
@@ -185,6 +238,7 @@ def fit_pdc(anchors: Dict[int, float], model_type: str = 'extended') -> PDCModel
                 powers,
                 p0=[cp_init, w_prime_init, p_max_init, tau_init],
                 bounds=([50, 1000, 200, 5], [500, 50000, 2500, 60]),
+                sigma=1/weights,  # Higher weight = lower sigma
                 maxfev=5000
             )
             cp, w_prime, p_max, tau = popt
@@ -198,25 +252,35 @@ def fit_pdc(anchors: Dict[int, float], model_type: str = 'extended') -> PDCModel
                     powers,
                     p0=[cp_init, w_prime_init],
                     bounds=([50, 1000], [500, 50000]),
+                    sigma=1/weights,
                     maxfev=5000
                 )
                 cp, w_prime = popt
-                p_max = max(powers) * 1.2
+                p_max = max(powers) * 1.1
                 tau = 20.0
             except Exception:
-                # Final fallback
-                cp = min(powers)
-                w_prime = (max(powers) - cp) * min(durations)
-                p_max = max(powers) * 1.2
+                # Final fallback - use anchor values directly
+                cp = powers[-1]  # Use longest duration
+                w_prime = (powers[0] - cp) * durations[0]
+                p_max = max(powers) * 1.1
                 tau = 20.0
     
-    return PDCModel(
-        cp=cp,
-        w_prime=w_prime,
-        p_max=p_max,
-        tau=tau,
-        anchors=dict(anchors)
-    )
+    # Validate: max_power at any anchor duration should not exceed anchor by >10%
+    # If it does, adjust CP downward
+    model = PDCModel(cp=cp, w_prime=w_prime, p_max=p_max, tau=tau, anchors=dict(anchors))
+    
+    # Check longest anchor specifically
+    longest_dur = max(anchors.keys())
+    longest_power = anchors[longest_dur]
+    model_power = model.max_power(longest_dur)
+    
+    if model_power > longest_power * 1.05:
+        # Model overestimates long duration - reduce CP
+        adjustment = (longest_power * 1.02) / model_power
+        cp = cp * adjustment
+        model = PDCModel(cp=cp, w_prime=w_prime, p_max=p_max, tau=tau, anchors=dict(anchors))
+    
+    return model
 
 
 def default_anchors_from_ftp(ftp: float) -> Dict[int, float]:
@@ -322,6 +386,119 @@ def compute_rolling_average(
     return rolling_avg
 
 
+def compute_normalized_power(
+    power_array: np.ndarray,
+    time_array: np.ndarray,
+    window_s: float = 30.0
+) -> float:
+    """
+    Compute Normalized Power (NP) for a power array.
+    
+    NP = 4th root of mean of (30-second rolling average)^4
+    
+    Args:
+        power_array: Array of power values
+        time_array: Array of cumulative times
+        window_s: Rolling average window (default 30s per NP standard)
+        
+    Returns:
+        Normalized Power in Watts
+    """
+    if len(power_array) < 2:
+        return np.mean(power_array) if len(power_array) > 0 else 0
+    
+    # Compute 30-second rolling average
+    rolling_avg = compute_rolling_average(power_array, time_array, window_s)
+    
+    # NP = 4th root of mean of 4th powers
+    return (np.mean(rolling_avg ** 4)) ** 0.25
+
+
+def compute_rolling_np(
+    power_array: np.ndarray,
+    time_array: np.ndarray,
+    window_s: float
+) -> float:
+    """
+    Compute the maximum NP over any window of the given duration.
+    
+    This is what we check against PDC limits - the highest NP achieved
+    over any window of that duration.
+    
+    Args:
+        power_array: Array of power values
+        time_array: Array of cumulative times
+        window_s: Duration window to check
+        
+    Returns:
+        Maximum NP over any window of that duration
+    """
+    if len(power_array) < 2 or time_array[-1] < window_s:
+        return compute_normalized_power(power_array, time_array)
+    
+    max_np = 0.0
+    n = len(power_array)
+    
+    # Slide window and compute NP for each position
+    # Use coarser step for efficiency (check every ~5% of window)
+    step = max(1, n // 50)
+    
+    for i in range(0, n, step):
+        current_time = time_array[i]
+        end_time = current_time + window_s
+        
+        if end_time > time_array[-1]:
+            break
+        
+        # Find points within this window
+        mask = (time_array >= current_time) & (time_array <= end_time)
+        
+        if np.sum(mask) > 1:
+            window_powers = power_array[mask]
+            window_times = time_array[mask] - current_time  # Normalize to start at 0
+            
+            # Compute NP for this window
+            np_val = compute_normalized_power(window_powers, window_times)
+            max_np = max(max_np, np_val)
+    
+    return max_np
+
+
+def get_check_windows(race_duration_s: float) -> List[int]:
+    """
+    Get appropriate PDC check windows based on race duration.
+    
+    Args:
+        race_duration_s: Expected race duration in seconds
+        
+    Returns:
+        List of duration windows to check
+    """
+    # Base windows for short efforts
+    windows = [5, 60, 300]
+    
+    # Add longer windows based on race duration
+    if race_duration_s > 600:    # >10 min
+        windows.append(600)
+    if race_duration_s > 1200:   # >20 min
+        windows.append(1200)
+    if race_duration_s > 1800:   # >30 min
+        windows.append(1800)
+    if race_duration_s > 2700:   # >45 min
+        windows.append(2700)
+    if race_duration_s > 3600:   # >60 min
+        windows.append(3600)
+    if race_duration_s > 5400:   # >90 min
+        windows.append(5400)
+    
+    # Always check a window at ~90% of race duration
+    long_window = int(race_duration_s * 0.9)
+    if long_window > 300 and long_window not in windows:
+        windows.append(long_window)
+    
+    return sorted(windows)
+
+
 def check_feasibility(
     power_array: np.ndarray,
     time_array: np.ndarray,
@@ -330,20 +507,25 @@ def check_feasibility(
     tolerance: float = 0.02
 ) -> List[Violation]:
     """
-    Check if a power plan violates PDC limits.
+    Check if a power plan violates PDC limits using Normalized Power.
+    
+    This checks that NP over any window doesn't exceed PDC max for that duration.
+    NP accounts for the physiological cost of variable power output.
     
     Args:
         power_array: Array of power values
         time_array: Array of cumulative times
         pdc: PDC model
-        windows: List of duration windows to check (default: [5, 60, 300, 1200])
+        windows: List of duration windows to check (auto-selected if None)
         tolerance: Allowed percentage over limit (default 2%)
         
     Returns:
         List of Violation objects for any exceeded limits
     """
+    race_duration = time_array[-1] if len(time_array) > 0 else 3600
+    
     if windows is None:
-        windows = [5, 60, 300, 1200]
+        windows = get_check_windows(race_duration)
     
     violations = []
     
@@ -352,17 +534,17 @@ def check_feasibility(
         if time_array[-1] < window_s:
             continue
         
-        rolling_avg = compute_rolling_average(power_array, time_array, window_s)
-        max_rolling = np.max(rolling_avg)
+        # Check NP over this window duration (not just average)
+        max_np = compute_rolling_np(power_array, time_array, window_s)
         max_allowed = pdc.max_power(window_s)
         
         threshold = max_allowed * (1 + tolerance)
         
-        if max_rolling > threshold:
-            excess_pct = (max_rolling / max_allowed - 1) * 100
+        if max_np > threshold:
+            excess_pct = (max_np / max_allowed - 1) * 100
             violations.append(Violation(
                 window_s=window_s,
-                actual_power=max_rolling,
+                actual_power=max_np,  # This is now NP, not average
                 max_allowed=max_allowed,
                 excess_pct=excess_pct
             ))
@@ -375,17 +557,19 @@ def compute_pdc_penalty(
     time_array: np.ndarray,
     pdc: PDCModel,
     windows: Optional[List[int]] = None,
-    penalty_weight: float = 1000.0
+    penalty_weight: float = 10000.0
 ) -> float:
     """
     Compute soft penalty for PDC violations.
+    
+    Uses a steep penalty function that makes violations very expensive.
     
     Args:
         power_array: Array of power values
         time_array: Array of cumulative times
         pdc: PDC model
-        windows: Duration windows to check
-        penalty_weight: Multiplier for penalty
+        windows: Duration windows to check (auto-selected if None)
+        penalty_weight: Multiplier for penalty (default 10000)
         
     Returns:
         Total penalty value
@@ -394,9 +578,17 @@ def compute_pdc_penalty(
     
     total_penalty = 0.0
     for v in violations:
-        # Quadratic penalty on excess
-        excess = max(0, v.actual_power - v.max_allowed)
-        total_penalty += penalty_weight * (excess / v.max_allowed) ** 2
+        # Strong penalty: linear component + quadratic for larger violations
+        excess_pct = v.excess_pct / 100.0  # Convert to fraction
+        
+        # Linear penalty for any violation (1% over = penalty_weight penalty)
+        linear_penalty = penalty_weight * excess_pct
+        
+        # Quadratic penalty grows with longer windows (violations at race duration are worse)
+        window_factor = max(1.0, v.window_s / 300.0)  # Scale by duration
+        quadratic_penalty = penalty_weight * (excess_pct ** 2) * window_factor * 10
+        
+        total_penalty += linear_penalty + quadratic_penalty
     
     return total_penalty
 
@@ -424,11 +616,11 @@ def format_violations(violations: List[Violation]) -> str:
     if not violations:
         return "No PDC violations detected."
     
-    lines = ["PDC Violations Detected:"]
+    lines = ["PDC Violations (Normalized Power exceeds limits):"]
     for v in violations:
         duration_str = format_duration(v.window_s)
         lines.append(
-            f"  - {duration_str} window: {v.actual_power:.0f}W actual vs "
+            f"  - {duration_str} window: {v.actual_power:.0f}W NP vs "
             f"{v.max_allowed:.0f}W max (+{v.excess_pct:.1f}%)"
         )
     
