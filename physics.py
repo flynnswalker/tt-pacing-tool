@@ -19,10 +19,12 @@ GRAVITY = 9.80665  # m/s²
 @dataclass
 class AeroConfig:
     """Aerodynamic configuration."""
-    cda_flat: float = 0.25       # CdA in TT/aero position (m²)
-    cda_climb: float = 0.32      # CdA in climbing position (m²)
-    grade_threshold: float = 6.0  # Switch to climb CdA above this grade (%)
-    speed_threshold: float = 6.0  # Switch to climb CdA below this speed (m/s, ~22 km/h)
+    bike_type: str = "tt"        # "tt" for TT bike, "road" for road bike
+    cda_aero: float = 0.22       # TT bike: CdA in aero position (m²)
+    cda_non_aero: float = 0.28   # TT bike: CdA on bars/drops (m²)
+    cda_road: float = 0.32       # Road bike: single CdA (m²)
+    grade_threshold: float = 5.0  # TT bike: switch to non-aero above this grade (%)
+    speed_threshold: float = 6.0  # TT bike: switch to non-aero below this speed (m/s, ~22 km/h)
 
 
 @dataclass
@@ -149,9 +151,10 @@ def get_cda(
     config: AeroConfig
 ) -> float:
     """
-    Determine CdA based on grade and speed.
+    Determine CdA based on bike type, grade and speed.
     
-    Uses climbing position when grade is steep OR speed is low.
+    For road bikes: single CdA regardless of conditions.
+    For TT bikes: switches between aero and non-aero based on grade/speed.
     
     Args:
         grade_pct: Current grade in percent
@@ -161,9 +164,14 @@ def get_cda(
     Returns:
         CdA value in m²
     """
-    if grade_pct > config.grade_threshold or speed_ms < config.speed_threshold:
-        return config.cda_climb
-    return config.cda_flat
+    if config.bike_type == "road":
+        # Road bike: single CdA, no switching
+        return config.cda_road
+    else:
+        # TT bike: switch between aero and non-aero positions
+        if grade_pct > config.grade_threshold or speed_ms < config.speed_threshold:
+            return config.cda_non_aero
+        return config.cda_aero
 
 
 def compute_gravity_force(

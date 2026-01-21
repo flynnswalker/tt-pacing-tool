@@ -554,3 +554,76 @@ def compare_strategies(
     }
     
     return results
+
+
+def compare_bikes(
+    course: Course,
+    weather: WeatherData,
+    tt_physics_config: PhysicsConfig,
+    road_physics_config: PhysicsConfig,
+    pdc: PDCModel,
+    opt_config: Optional[OptimizationConfig] = None,
+    log_callback: Optional[Callable[[str], None]] = None
+) -> dict:
+    """
+    Compare TT bike vs Road bike for a course.
+    
+    Runs optimization for both bike configurations and returns comparison.
+    
+    Args:
+        course: Course to optimize
+        weather: Weather conditions
+        tt_physics_config: Physics config for TT bike
+        road_physics_config: Physics config for Road bike
+        pdc: Power duration curve
+        opt_config: Optimization configuration
+        log_callback: Optional callback for log messages
+        
+    Returns:
+        Dictionary with comparison results
+    """
+    def log(msg: str):
+        if log_callback:
+            log_callback(msg)
+    
+    log("=== BIKE COMPARISON ===")
+    log("")
+    log("Optimizing for TT bike...")
+    tt_result = optimize_pacing(
+        course, weather, tt_physics_config, pdc, opt_config, log_callback=None
+    )
+    log(f"  TT bike time: {tt_result.total_time_s:.1f}s ({tt_result.total_time_s/60:.1f} min)")
+    
+    log("")
+    log("Optimizing for Road bike...")
+    road_result = optimize_pacing(
+        course, weather, road_physics_config, pdc, opt_config, log_callback=None
+    )
+    log(f"  Road bike time: {road_result.total_time_s:.1f}s ({road_result.total_time_s/60:.1f} min)")
+    
+    # Determine recommendation
+    time_delta = tt_result.total_time_s - road_result.total_time_s
+    
+    if time_delta < -5:  # TT is more than 5 seconds faster
+        recommended = 'tt'
+        reason = f"TT bike is {abs(time_delta):.1f}s faster"
+    elif time_delta > 5:  # Road is more than 5 seconds faster
+        recommended = 'road'
+        reason = f"Road bike is {abs(time_delta):.1f}s faster"
+    else:
+        # Within 5 seconds - essentially equal
+        recommended = 'either'
+        reason = f"Both bikes within {abs(time_delta):.1f}s - choose based on comfort"
+    
+    log("")
+    log(f"Recommendation: {recommended.upper()} - {reason}")
+    
+    return {
+        'tt_result': tt_result,
+        'road_result': road_result,
+        'tt_time': tt_result.total_time_s,
+        'road_time': road_result.total_time_s,
+        'time_delta': time_delta,
+        'recommended': recommended,
+        'reason': reason
+    }

@@ -5,6 +5,7 @@ Segmentation Module - Auto-segmentation, manual split/merge operations.
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import numpy as np
+from scipy.signal import savgol_filter
 
 from gpx_io import Course
 from physics import SimulationResult
@@ -151,87 +152,132 @@ def compute_segment_stats(
     )
 
 
-def auto_segment(
+def find_gradient_kinks(
     course: Course,
-    sim_result: SimulationResult,
-    grade_change_threshold: float = 2.0,
-    min_segment_m: float = 500.0,
-    max_segment_m: float = 5000.0,  # Kept for API compatibility but not used
-    target_segments: int = 6
-) -> List[Segment]:
+    smoothing_window: int = 11,
+    derivative_threshold: float = 0.5
+) -> List[int]:
     """
-    Automatically segment a course by clustering sections with similar target power.
-    
-    Strategy: Start with many small segments, then iteratively merge the most
-    similar adjacent pairs until we reach the target count.
+    Find points where gradient changes direction (inflection points).
+    Uses the second derivative of elevation (first derivative of grade).
     
     Args:
-        course: Course to segment
-        sim_result: Simulation result with power/speed/time
-        grade_change_threshold: Not used (kept for API compatibility)
-        min_segment_m: Minimum segment length in meters
-        max_segment_m: Not used (kept for API compatibility)
-        target_segments: Target number of segments
+        course: Course with elevation data
+        smoothing_window: Window size for Savitzky-Golay smoothing (must be odd)
+        derivative_threshold: Threshold for significant gradient change
         
     Returns:
-        List of Segment objects
+        List of point indices where gradient inflection occurs
     """
-    n_points = len(course.points)
-    total_distance = course.total_distance_m
-    
-    if n_points < 2:
+    if len(course.points) < smoothing_window:
         return []
     
-    powers = np.array([p.power_w for p in sim_result.points])
+    # Extract grades
+    grades = np.array([p.grade_pct for p in course.points])
     
-    # Step 1: Start with FINE granularity to capture terrain changes
-    # Use 200m or total/50, whichever is smaller - we need detail first, then merge
-    initial_segment_len = min(200, total_distance / 50)
+    # Smooth grades to reduce GPS noise
+    # savgol_filter requires odd window size
+    if smoothing_window % 2 == 0:
+        smoothing_window += 1
+    smoothing_window = min(smoothing_window, len(grades) - 1)
+    if smoothing_window < 3:
+        smoothing_window = 3
     
+    smoothed = savgol_filter(grades, smoothing_window, polyorder=2)
+    
+    # First derivative of grade = rate of change of gradient
+    # This tells us where the slope is getting steeper or shallower
+    grade_derivative = np.gradient(smoothed)
+    
+    # Find inflection points: where the derivative changes sign (zero crossings)
+    # Also catch points where derivative magnitude exceeds threshold (sharp changes)
+    kinks = []
+    
+    for i in range(1, len(grade_derivative) - 1):
+        # Zero crossing: sign change in derivative
+        if grade_derivative[i-1] * grade_derivative[i+1] < 0:
+            kinks.append(i)
+        # Large magnitude change: significant gradient shift
+        elif abs(grade_derivative[i]) > derivative_threshold:
+            # Only add if not too close to last kink
+            if not kinks or i - kinks[-1] > 5:
+                kinks.append(i)
+    
+    return sorted(set(kinks))
+
+
+def segments_from_kinks(
+    course: Course,
+    kinks: List[int],
+    min_segment_m: float = 200.0
+) -> List[int]:
+    """
+    Convert kink indices to segment boundaries, respecting minimum length.
+    
+    Args:
+        course: Course data
+        kinks: List of kink point indices
+        min_segment_m: Minimum segment length in meters
+        
+    Returns:
+        List of boundary indices (including 0 and n_points)
+    """
+    n_points = len(course.points)
     boundaries = [0]
-    for i in range(1, n_points):
-        dist_since_last = course.points[i].distance_m - course.points[boundaries[-1]].distance_m
-        if dist_since_last >= initial_segment_len:
-            boundaries.append(i)
-    boundaries.append(n_points)
     
-    # Step 2: Iteratively merge the most similar adjacent segments
-    # until we reach target count
-    while len(boundaries) - 1 > target_segments:
-        # Find the pair with smallest power difference
-        best_merge_idx = None
-        best_merge_score = float('inf')
+    for kink_idx in kinks:
+        if kink_idx >= n_points:
+            continue
+            
+        kink_dist = course.points[kink_idx].distance_m
+        last_dist = course.points[boundaries[-1]].distance_m
         
-        for i in range(len(boundaries) - 2):
-            start1, end1 = boundaries[i], boundaries[i + 1]
-            start2, end2 = boundaries[i + 1], boundaries[i + 2]
-            
-            # Calculate average power for each segment
-            avg1 = np.mean(powers[start1:end1]) if end1 > start1 else 0
-            avg2 = np.mean(powers[start2:end2]) if end2 > start2 else 0
-            
-            # Score = power difference (lower = better merge candidate)
-            score = abs(avg1 - avg2)
-            
-            if score < best_merge_score:
-                best_merge_score = score
-                best_merge_idx = i + 1
-        
-        if best_merge_idx is not None:
-            boundaries.pop(best_merge_idx)
-        else:
-            break  # Can't merge any more
+        # Only add if min distance from last boundary
+        if kink_dist - last_dist >= min_segment_m:
+            boundaries.append(kink_idx)
     
-    # Step 3: Final pass - merge any adjacent segments with very similar power
-    # If powers are nearly identical, merge regardless of length - the goal is
-    # to give the rider ONE target for that section, not arbitrary splits
-    similarity_threshold = 0.03  # 3% = essentially the same power target
+    # Make sure final boundary is included
+    if boundaries[-1] != n_points:
+        # Check if last segment would be too short
+        last_dist = course.points[boundaries[-1]].distance_m
+        end_dist = course.points[-1].distance_m
+        if end_dist - last_dist < min_segment_m and len(boundaries) > 1:
+            # Remove last boundary so it merges with final segment
+            boundaries.pop()
+        boundaries.append(n_points)
+    
+    return boundaries
+
+
+def merge_similar_segments(
+    boundaries: List[int],
+    powers: np.ndarray,
+    threshold: float = 0.03
+) -> List[int]:
+    """
+    Iteratively merge adjacent segments with power difference <= threshold.
+    
+    Merges the MOST similar pair first (smallest power difference),
+    but only if that difference is <= threshold.
+    
+    Args:
+        boundaries: List of segment boundary indices
+        powers: Array of power values for each point
+        threshold: Maximum relative power difference (0.03 = 3%) for merge
+        
+    Returns:
+        Updated list of boundaries after merging
+    """
+    boundaries = boundaries.copy()  # Don't modify original
     
     changed = True
     while changed:
         changed = False
-        i = 0
-        while i < len(boundaries) - 2:
+        best_merge = None
+        best_diff = float('inf')
+        
+        # Find the pair with smallest power difference that's also <= threshold
+        for i in range(len(boundaries) - 2):
             start1, end1 = boundaries[i], boundaries[i + 1]
             start2, end2 = boundaries[i + 1], boundaries[i + 2]
             
@@ -239,15 +285,178 @@ def auto_segment(
             avg2 = np.mean(powers[start2:end2]) if end2 > start2 else 0
             avg_both = (avg1 + avg2) / 2
             
-            # Check if very similar - if so, merge regardless of length
-            if avg_both > 0 and abs(avg1 - avg2) / avg_both < similarity_threshold:
-                boundaries.pop(i + 1)
-                changed = True
-                # Don't increment i - check the same position again with new neighbor
-                continue
-            i += 1
+            if avg_both > 0:
+                diff_pct = abs(avg1 - avg2) / avg_both
+            else:
+                diff_pct = 0
+            
+            # Only merge if within threshold AND it's the smallest difference
+            if diff_pct <= threshold and diff_pct < best_diff:
+                best_diff = diff_pct
+                best_merge = i + 1
+        
+        if best_merge is not None:
+            boundaries.pop(best_merge)
+            changed = True
     
-    # Step 4: Create final segments
+    return boundaries
+
+
+def merge_short_duration_segments(
+    boundaries: List[int],
+    sim_result: SimulationResult,
+    min_duration_s: float = 30.0
+) -> List[int]:
+    """
+    Merge segments that are shorter than the minimum duration.
+    
+    Short segments are merged with the adjacent segment that has the most
+    similar average power.
+    
+    Args:
+        boundaries: List of segment boundary indices
+        sim_result: Simulation result with time data
+        min_duration_s: Minimum segment duration in seconds
+        
+    Returns:
+        Updated list of boundaries after merging short segments
+    """
+    if len(boundaries) <= 2:
+        return boundaries
+    
+    boundaries = boundaries.copy()
+    times = np.array([p.time_s for p in sim_result.points])
+    powers = np.array([p.power_w for p in sim_result.points])
+    
+    changed = True
+    while changed and len(boundaries) > 2:
+        changed = False
+        
+        # Find shortest segment that's below minimum duration
+        shortest_idx = None
+        shortest_duration = float('inf')
+        
+        for i in range(len(boundaries) - 1):
+            start_idx, end_idx = boundaries[i], boundaries[i + 1]
+            if end_idx <= start_idx:
+                continue
+            
+            # Calculate segment duration
+            start_time = times[start_idx]
+            end_time = times[min(end_idx, len(times) - 1)]
+            duration = end_time - start_time
+            
+            if duration < min_duration_s and duration < shortest_duration:
+                shortest_duration = duration
+                shortest_idx = i
+        
+        if shortest_idx is not None:
+            # Merge this segment with the more similar neighbor
+            start_idx = boundaries[shortest_idx]
+            end_idx = boundaries[shortest_idx + 1]
+            avg_power = np.mean(powers[start_idx:end_idx]) if end_idx > start_idx else 0
+            
+            # Check neighbors
+            merge_with_prev = False
+            merge_with_next = False
+            
+            if shortest_idx > 0:
+                # Previous segment exists
+                prev_start = boundaries[shortest_idx - 1]
+                prev_end = boundaries[shortest_idx]
+                prev_power = np.mean(powers[prev_start:prev_end]) if prev_end > prev_start else 0
+                prev_diff = abs(avg_power - prev_power)
+                merge_with_prev = True
+            else:
+                prev_diff = float('inf')
+            
+            if shortest_idx + 2 < len(boundaries):
+                # Next segment exists
+                next_start = boundaries[shortest_idx + 1]
+                next_end = boundaries[shortest_idx + 2]
+                next_power = np.mean(powers[next_start:next_end]) if next_end > next_start else 0
+                next_diff = abs(avg_power - next_power)
+                merge_with_next = True
+            else:
+                next_diff = float('inf')
+            
+            # Merge with the more similar neighbor
+            if merge_with_prev and (not merge_with_next or prev_diff <= next_diff):
+                # Remove boundary between this segment and previous
+                boundaries.pop(shortest_idx)
+            elif merge_with_next:
+                # Remove boundary between this segment and next
+                boundaries.pop(shortest_idx + 1)
+            else:
+                # Can't merge (shouldn't happen)
+                break
+            
+            changed = True
+    
+    return boundaries
+
+
+def auto_segment(
+    course: Course,
+    sim_result: SimulationResult,
+    grade_change_threshold: float = 2.0,  # Kept for API compatibility
+    min_segment_m: float = 200.0,
+    max_segment_m: float = 5000.0,  # Kept for API compatibility but not used
+    target_segments: int = 6,
+    min_segment_duration_s: float = 30.0
+) -> List[Segment]:
+    """
+    Automatically segment a course using gradient inflection points.
+    
+    Strategy:
+    1. Find gradient "kinks" (inflection points) using second derivative of elevation
+    2. Create initial segments from kinks, respecting min_segment_m
+    3. Iteratively merge adjacent segments with similar target power (<= 4% difference)
+    4. Merge any segments shorter than min_segment_duration_s
+    
+    Args:
+        course: Course to segment
+        sim_result: Simulation result with power/speed/time
+        grade_change_threshold: Not used (kept for API compatibility)
+        min_segment_m: Minimum segment length in meters
+        max_segment_m: Not used (kept for API compatibility)
+        target_segments: Not used directly (merging is based on power similarity)
+        min_segment_duration_s: Minimum segment duration in seconds (default 30s)
+        
+    Returns:
+        List of Segment objects
+    """
+    n_points = len(course.points)
+    
+    if n_points < 2:
+        return []
+    
+    powers = np.array([p.power_w for p in sim_result.points])
+    
+    # Step 1: Find gradient inflection points (kinks)
+    kinks = find_gradient_kinks(course, smoothing_window=11, derivative_threshold=0.5)
+    
+    # Step 2: Create initial segment boundaries from kinks
+    if kinks:
+        boundaries = segments_from_kinks(course, kinks, min_segment_m)
+    else:
+        # Fallback: if no kinks found, create regular segments
+        boundaries = [0]
+        initial_len = max(min_segment_m, course.total_distance_m / 10)
+        for i in range(1, n_points):
+            dist_since_last = course.points[i].distance_m - course.points[boundaries[-1]].distance_m
+            if dist_since_last >= initial_len:
+                boundaries.append(i)
+        boundaries.append(n_points)
+    
+    # Step 3: Iteratively merge segments with similar power (<= 4% difference)
+    boundaries = merge_similar_segments(boundaries, powers, threshold=0.04)
+    
+    # Step 4: Merge segments shorter than minimum duration
+    if min_segment_duration_s > 0:
+        boundaries = merge_short_duration_segments(boundaries, sim_result, min_segment_duration_s)
+    
+    # Step 5: Create final segment objects
     segments = []
     cumulative_time = 0.0
     

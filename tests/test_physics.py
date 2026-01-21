@@ -19,38 +19,54 @@ from physics import (
 class TestCdaSwitching:
     """Tests for CdA switching logic."""
     
-    def test_flat_terrain_uses_flat_cda(self):
-        """Flat terrain at normal speed should use flat CdA."""
-        config = AeroConfig(cda_flat=0.25, cda_climb=0.32,
+    def test_flat_terrain_uses_aero_cda(self):
+        """Flat terrain at normal speed should use aero CdA (TT bike)."""
+        config = AeroConfig(bike_type='tt', cda_aero=0.22, cda_non_aero=0.28,
                            grade_threshold=6.0, speed_threshold=6.0)
         
         cda = get_cda(grade_pct=2.0, speed_ms=10.0, config=config)
-        assert cda == 0.25
+        assert cda == 0.22
     
-    def test_steep_grade_uses_climb_cda(self):
-        """Steep grade should use climb CdA."""
-        config = AeroConfig(cda_flat=0.25, cda_climb=0.32,
+    def test_steep_grade_uses_non_aero_cda(self):
+        """Steep grade should use non-aero CdA (TT bike)."""
+        config = AeroConfig(bike_type='tt', cda_aero=0.22, cda_non_aero=0.28,
                            grade_threshold=6.0, speed_threshold=6.0)
         
         cda = get_cda(grade_pct=8.0, speed_ms=10.0, config=config)
-        assert cda == 0.32
+        assert cda == 0.28
     
-    def test_low_speed_uses_climb_cda(self):
-        """Low speed should use climb CdA."""
-        config = AeroConfig(cda_flat=0.25, cda_climb=0.32,
+    def test_low_speed_uses_non_aero_cda(self):
+        """Low speed should use non-aero CdA (TT bike)."""
+        config = AeroConfig(bike_type='tt', cda_aero=0.22, cda_non_aero=0.28,
                            grade_threshold=6.0, speed_threshold=6.0)
         
         cda = get_cda(grade_pct=2.0, speed_ms=4.0, config=config)
-        assert cda == 0.32
+        assert cda == 0.28
     
     def test_threshold_boundary(self):
         """Test behavior at exact threshold values."""
-        config = AeroConfig(cda_flat=0.25, cda_climb=0.32,
+        config = AeroConfig(bike_type='tt', cda_aero=0.22, cda_non_aero=0.28,
                            grade_threshold=6.0, speed_threshold=6.0)
         
-        # At exact threshold, should still use flat
+        # At exact threshold, should still use aero
         cda = get_cda(grade_pct=6.0, speed_ms=6.0, config=config)
-        assert cda == 0.25  # <= threshold uses flat
+        assert cda == 0.22  # <= threshold uses aero
+    
+    def test_road_bike_single_cda(self):
+        """Road bike should use single CdA regardless of conditions."""
+        config = AeroConfig(bike_type='road', cda_road=0.32)
+        
+        # Flat terrain
+        cda1 = get_cda(grade_pct=2.0, speed_ms=10.0, config=config)
+        assert cda1 == 0.32
+        
+        # Steep grade
+        cda2 = get_cda(grade_pct=12.0, speed_ms=10.0, config=config)
+        assert cda2 == 0.32
+        
+        # Low speed
+        cda3 = get_cda(grade_pct=2.0, speed_ms=2.0, config=config)
+        assert cda3 == 0.32
 
 
 class TestForces:

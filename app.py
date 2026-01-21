@@ -18,7 +18,7 @@ from weather import (
 )
 from physics import PhysicsConfig, AeroConfig, simulate_constant_power
 from pdc import PDCModel, fit_pdc, default_anchors_from_ftp, check_feasibility, format_violations
-from optimizer import optimize_pacing, OptimizationConfig, OptimizationResult
+from optimizer import optimize_pacing, OptimizationConfig, OptimizationResult, compare_bikes
 from segmentation import auto_segment, split_segment_at_distance, merge_segments, Segment
 from reporting import (
     create_power_plot, create_speed_plot, create_elevation_profile,
@@ -209,42 +209,69 @@ def sidebar_equipment() -> dict:
     """Render equipment parameters in sidebar."""
     st.sidebar.header("Equipment")
     
+    # Bike type selection
+    bike_type = st.sidebar.radio(
+        "Bike Type",
+        ["TT Bike", "Road Bike"],
+        index=0,
+        help="TT bike uses aero/non-aero position switching; Road bike uses single CdA"
+    )
+    
     with st.sidebar.expander("Aerodynamics", expanded=False):
-        cda_flat = st.number_input(
-            "CdA Flat (m²)",
-            min_value=0.15,
-            max_value=0.40,
-            value=0.26,
-            step=0.01,
-            help="Drag area in TT position"
-        )
-        
-        cda_climb = st.number_input(
-            "CdA Climb (m²)",
-            min_value=0.20,
-            max_value=0.50,
-            value=0.32,
-            step=0.01,
-            help="Drag area in climbing position"
-        )
-        
-        grade_threshold = st.number_input(
-            "Grade Threshold (%)",
-            min_value=0.0,
-            max_value=15.0,
-            value=5.0,
-            step=0.5,
-            help="Switch to climb CdA above this grade"
-        )
-        
-        speed_threshold = st.number_input(
-            "Speed Threshold (km/h)",
-            min_value=10.0,
-            max_value=40.0,
-            value=22.0,
-            step=1.0,
-            help="Switch to climb CdA below this speed"
-        )
+        if bike_type == "TT Bike":
+            col1, col2 = st.columns(2)
+            with col1:
+                cda_aero = st.number_input(
+                    "CdA Aero (m²)",
+                    min_value=0.15,
+                    max_value=0.35,
+                    value=0.22,
+                    step=0.01,
+                    help="Drag area in full aero position (skis/extensions)"
+                )
+            with col2:
+                cda_non_aero = st.number_input(
+                    "CdA Bars (m²)",
+                    min_value=0.20,
+                    max_value=0.40,
+                    value=0.28,
+                    step=0.01,
+                    help="Drag area on bars/drops (climbing position)"
+                )
+            
+            grade_threshold = st.number_input(
+                "Grade Threshold (%)",
+                min_value=0.0,
+                max_value=15.0,
+                value=5.0,
+                step=0.5,
+                help="Switch to bars CdA above this grade"
+            )
+            
+            speed_threshold = st.number_input(
+                "Speed Threshold (km/h)",
+                min_value=10.0,
+                max_value=40.0,
+                value=22.0,
+                step=1.0,
+                help="Switch to bars CdA below this speed"
+            )
+            
+            cda_road = 0.32  # Default, not used for TT
+        else:
+            # Road bike - single CdA
+            cda_road = st.number_input(
+                "CdA (m²)",
+                min_value=0.25,
+                max_value=0.45,
+                value=0.32,
+                step=0.01,
+                help="Drag area (single position for road bike)"
+            )
+            cda_aero = 0.22  # Defaults, not used
+            cda_non_aero = 0.28
+            grade_threshold = 5.0
+            speed_threshold = 22.0
     
     with st.sidebar.expander("Rolling Resistance", expanded=False):
         crr = st.number_input(
@@ -258,8 +285,10 @@ def sidebar_equipment() -> dict:
         )
     
     return {
-        'cda_flat': cda_flat,
-        'cda_climb': cda_climb,
+        'bike_type': 'tt' if bike_type == "TT Bike" else 'road',
+        'cda_aero': cda_aero,
+        'cda_non_aero': cda_non_aero,
+        'cda_road': cda_road,
         'grade_threshold': grade_threshold,
         'speed_threshold_ms': speed_threshold / 3.6,
         'crr': crr
@@ -352,6 +381,15 @@ def sidebar_advanced() -> dict:
             step=50
         )
         
+        min_segment_duration_s = st.number_input(
+            "Min Segment Duration (s)",
+            min_value=0,
+            max_value=120,
+            value=30,
+            step=5,
+            help="Segments shorter than this will be merged with neighbors"
+        )
+        
         target_segments = st.number_input(
             "Target # of Segments",
             min_value=3,
@@ -366,6 +404,7 @@ def sidebar_advanced() -> dict:
         'regularization': regularization,
         'grade_seg_threshold': grade_seg_threshold,
         'min_segment_m': min_segment_m,
+        'min_segment_duration_s': min_segment_duration_s,
         'target_segments': target_segments
     }
 
@@ -501,7 +540,8 @@ def render_segments_tab(course: Course, result: OptimizationResult, advanced: di
                 course, result.simulation,
                 grade_change_threshold=advanced['grade_seg_threshold'],
                 min_segment_m=advanced['min_segment_m'],
-                target_segments=advanced['target_segments']
+                target_segments=advanced['target_segments'],
+                min_segment_duration_s=advanced['min_segment_duration_s']
             )
             st.rerun()
     
@@ -688,6 +728,62 @@ def main():
     # Generate button
     generate_clicked = st.sidebar.button("Generate Plan", type="primary", use_container_width=True)
     
+    # Bike comparison feature
+    with st.sidebar.expander("Compare Bikes", expanded=False):
+        st.caption("Compare TT bike vs Road bike for this course")
+        
+        # Alternate bike config
+        if equipment['bike_type'] == 'tt':
+            st.write("**Road Bike Config (alternate):**")
+            alt_bike_weight = st.number_input(
+                "Road Bike Weight (kg)",
+                min_value=5.0,
+                max_value=15.0,
+                value=7.5,
+                step=0.5,
+                key="alt_bike_weight"
+            )
+            alt_cda = st.number_input(
+                "Road Bike CdA (m²)",
+                min_value=0.25,
+                max_value=0.45,
+                value=0.32,
+                step=0.01,
+                key="alt_cda"
+            )
+        else:
+            st.write("**TT Bike Config (alternate):**")
+            alt_bike_weight = st.number_input(
+                "TT Bike Weight (kg)",
+                min_value=5.0,
+                max_value=15.0,
+                value=8.5,
+                step=0.5,
+                key="alt_bike_weight"
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                alt_cda_aero = st.number_input(
+                    "CdA Aero (m²)",
+                    min_value=0.15,
+                    max_value=0.35,
+                    value=0.22,
+                    step=0.01,
+                    key="alt_cda_aero"
+                )
+            with col2:
+                alt_cda_non_aero = st.number_input(
+                    "CdA Bars (m²)",
+                    min_value=0.20,
+                    max_value=0.40,
+                    value=0.28,
+                    step=0.01,
+                    key="alt_cda_non_aero"
+                )
+            alt_cda = None  # Not used for TT
+        
+        compare_clicked = st.button("Compare Bikes", use_container_width=True)
+    
     # Profile save/load
     st.sidebar.header("User Profile")
     
@@ -753,8 +849,10 @@ def main():
             # Build configs
             log_callback("Building configuration...")
             aero_config = AeroConfig(
-                cda_flat=equipment['cda_flat'],
-                cda_climb=equipment['cda_climb'],
+                bike_type=equipment['bike_type'],
+                cda_aero=equipment['cda_aero'],
+                cda_non_aero=equipment['cda_non_aero'],
+                cda_road=equipment['cda_road'],
                 grade_threshold=equipment['grade_threshold'],
                 speed_threshold=equipment['speed_threshold_ms']
             )
@@ -765,7 +863,10 @@ def main():
                 aero=aero_config
             )
             log_callback(f"  Rider mass: {rider['mass']}kg, Crr: {equipment['crr']}")
-            log_callback(f"  CdA flat: {equipment['cda_flat']}, CdA climb: {equipment['cda_climb']}")
+            if equipment['bike_type'] == 'tt':
+                log_callback(f"  TT bike: CdA aero={equipment['cda_aero']}, CdA bars={equipment['cda_non_aero']}")
+            else:
+                log_callback(f"  Road bike: CdA={equipment['cda_road']}")
             
             # Get weather
             log_callback("Fetching weather data...")
@@ -822,7 +923,8 @@ def main():
                 course, result.simulation,
                 grade_change_threshold=advanced['grade_seg_threshold'],
                 min_segment_m=advanced['min_segment_m'],
-                target_segments=advanced['target_segments']
+                target_segments=advanced['target_segments'],
+                min_segment_duration_s=advanced['min_segment_duration_s']
             )
             st.session_state.segments = segments
             log_callback(f"  Created {len(segments)} segments")
@@ -831,6 +933,97 @@ def main():
                 f"Optimization complete! Time: {result.total_time_s:.1f}s "
                 f"(saved {result.time_saved_s:.1f}s / {result.time_saved_pct:.1f}%)"
             )
+    
+    # Handle bike comparison
+    if compare_clicked and st.session_state.course is not None:
+        course = st.session_state.course
+        
+        st.subheader("Bike Comparison")
+        comparison_log = st.expander("Comparison Log", expanded=True)
+        log_placeholder = comparison_log.empty()
+        log_messages = []
+        
+        def log_callback(msg: str):
+            log_messages.append(msg)
+            log_placeholder.code("\n".join(log_messages[-20:]), language=None)
+        
+        # Build weather (use session state if available, otherwise create fallback)
+        if st.session_state.weather:
+            weather = st.session_state.weather
+        else:
+            env_config = EnvironmentConfig(
+                use_forecast=False,
+                fallback_temp_c=environment.get('temp', 20),
+                fallback_pressure_hpa=environment.get('pressure', 1013),
+                fallback_humidity_pct=environment.get('humidity', 50),
+                fallback_wind_speed_ms=environment.get('wind_speed_ms', 0),
+                fallback_wind_direction_deg=environment.get('wind_dir', 0)
+            )
+            weather = create_fallback_weather(course.start_lat, course.start_lon, env_config)
+        
+        # Build PDC
+        pdc = fit_pdc(anchors)
+        
+        # Build both bike configs
+        if equipment['bike_type'] == 'tt':
+            # Current is TT, alternate is Road
+            tt_aero = AeroConfig(
+                bike_type='tt',
+                cda_aero=equipment['cda_aero'],
+                cda_non_aero=equipment['cda_non_aero'],
+                grade_threshold=equipment['grade_threshold'],
+                speed_threshold=equipment['speed_threshold_ms']
+            )
+            road_aero = AeroConfig(
+                bike_type='road',
+                cda_road=alt_cda
+            )
+            tt_mass = rider['mass']
+            road_mass = rider['rider_weight'] + alt_bike_weight
+        else:
+            # Current is Road, alternate is TT
+            road_aero = AeroConfig(
+                bike_type='road',
+                cda_road=equipment['cda_road']
+            )
+            tt_aero = AeroConfig(
+                bike_type='tt',
+                cda_aero=alt_cda_aero,
+                cda_non_aero=alt_cda_non_aero,
+                grade_threshold=5.0,
+                speed_threshold=6.0
+            )
+            road_mass = rider['mass']
+            tt_mass = rider['rider_weight'] + alt_bike_weight
+        
+        tt_physics = PhysicsConfig(mass_kg=tt_mass, crr=equipment['crr'], aero=tt_aero)
+        road_physics = PhysicsConfig(mass_kg=road_mass, crr=equipment['crr'], aero=road_aero)
+        
+        opt_config = OptimizationConfig(regularization=advanced['regularization'], verbose=False)
+        
+        # Run comparison
+        comparison = compare_bikes(
+            course, weather, tt_physics, road_physics, pdc, opt_config, log_callback
+        )
+        
+        # Display results
+        st.write("---")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("TT Bike", f"{comparison['tt_time']/60:.1f} min")
+        with col2:
+            st.metric("Road Bike", f"{comparison['road_time']/60:.1f} min")
+        with col3:
+            delta = comparison['time_delta']
+            if comparison['recommended'] == 'tt':
+                st.metric("Recommendation", "TT Bike", delta=f"{abs(delta):.1f}s faster")
+            elif comparison['recommended'] == 'road':
+                st.metric("Recommendation", "Road Bike", delta=f"{abs(delta):.1f}s faster")
+            else:
+                st.metric("Recommendation", "Either", delta=f"Within {abs(delta):.1f}s")
+        
+        st.info(comparison['reason'])
     
     # Main content area with tabs
     course = st.session_state.course
