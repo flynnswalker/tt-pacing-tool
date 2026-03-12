@@ -6,3 +6,4 @@ plotly>=5.18
 gpxpy>=1.6
 requests>=2.31
 pytest>=7.4
+fit-tool>=0.9.13

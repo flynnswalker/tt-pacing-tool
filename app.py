@@ -26,6 +26,7 @@ from reporting import (
     generate_race_guidance, format_race_card, export_plan_csv,
     create_segment_overlay_chart
 )
+from fit_export import create_fit_workout, get_workout_summary
 import json
 import os
 
@@ -1096,6 +1097,51 @@ def main():
             file_name="pacing_plan.csv",
             mime="text/csv"
         )
+        
+        # Garmin FIT workout export
+        if segments:
+            st.sidebar.markdown("---")
+            st.sidebar.subheader("Garmin Workout")
+            
+            # Power range slider
+            power_range = st.sidebar.slider(
+                "Target Power Range (+/- W)",
+                min_value=5,
+                max_value=30,
+                value=10,
+                step=5,
+                help="Power target tolerance shown on Garmin"
+            )
+            
+            # Generate workout name from course
+            workout_name = "TT Pacing"
+            if hasattr(course, 'name') and course.name:
+                workout_name = course.name[:15]
+            
+            try:
+                fit_data = create_fit_workout(
+                    segments,
+                    workout_name=workout_name,
+                    power_range_watts=power_range
+                )
+                
+                st.sidebar.download_button(
+                    "Download Garmin Workout (.fit)",
+                    fit_data,
+                    file_name=f"{workout_name.replace(' ', '_')}_workout.fit",
+                    mime="application/octet-stream"
+                )
+                
+                # Show workout summary in expander
+                with st.sidebar.expander("Workout Preview"):
+                    st.text(get_workout_summary(segments))
+                    st.caption(
+                        "Transfer to Garmin via:\n"
+                        "1. Upload to Garmin Connect, or\n"
+                        "2. Copy to device `/Garmin/NewFiles/`"
+                    )
+            except Exception as e:
+                st.sidebar.error(f"Error generating workout: {e}")
 
 
 if __name__ == "__main__":
