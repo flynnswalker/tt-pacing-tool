@@ -188,13 +188,13 @@ def find_gradient_kinks(
     # First derivative of grade = rate of change of gradient
     # This tells us where the slope is getting steeper or shallower
     grade_derivative = np.gradient(smoothed)
-    
+
     # Find inflection points: where the derivative changes sign (zero crossings)
     # Also catch points where derivative magnitude exceeds threshold (sharp changes)
     kinks = []
-    
+
     for i in range(1, len(grade_derivative) - 1):
-        # Zero crossing: sign change in derivative
+        # Zero crossing: sign change in derivative (local max/min of grade)
         if grade_derivative[i-1] * grade_derivative[i+1] < 0:
             kinks.append(i)
         # Large magnitude change: significant gradient shift
@@ -202,7 +202,19 @@ def find_gradient_kinks(
             # Only add if not too close to last kink
             if not kinks or i - kinks[-1] > 5:
                 kinks.append(i)
-    
+
+    # Also explicitly add points where the smoothed grade crosses zero
+    # (uphill <-> downhill transitions) — these are always critical boundaries
+    flat_threshold = 0.5  # grades within ±0.5% are considered "flat"
+    for i in range(1, len(smoothed)):
+        prev, curr = smoothed[i - 1], smoothed[i]
+        # Sign change (uphill to downhill or vice versa)
+        if prev * curr < 0:
+            kinks.append(i)
+        # Transition into or out of a flat section
+        elif (abs(prev) > flat_threshold) != (abs(curr) > flat_threshold):
+            kinks.append(i)
+
     return sorted(set(kinks))
 
 
@@ -252,53 +264,73 @@ def segments_from_kinks(
 def merge_similar_segments(
     boundaries: List[int],
     powers: np.ndarray,
+    grades: np.ndarray,
     threshold: float = 0.03
 ) -> List[int]:
     """
     Iteratively merge adjacent segments with power difference <= threshold.
-    
+
     Merges the MOST similar pair first (smallest power difference),
-    but only if that difference is <= threshold.
-    
+    but only if that difference is <= threshold AND the segments don't have
+    fundamentally different terrain characters (e.g., one climbing, one descending).
+
     Args:
         boundaries: List of segment boundary indices
         powers: Array of power values for each point
+        grades: Array of grade values for each point
         threshold: Maximum relative power difference (0.03 = 3%) for merge
-        
+
     Returns:
         Updated list of boundaries after merging
     """
     boundaries = boundaries.copy()  # Don't modify original
-    
+
     changed = True
     while changed:
         changed = False
         best_merge = None
         best_diff = float('inf')
-        
+
         # Find the pair with smallest power difference that's also <= threshold
         for i in range(len(boundaries) - 2):
             start1, end1 = boundaries[i], boundaries[i + 1]
             start2, end2 = boundaries[i + 1], boundaries[i + 2]
-            
+
             avg1 = np.mean(powers[start1:end1]) if end1 > start1 else 0
             avg2 = np.mean(powers[start2:end2]) if end2 > start2 else 0
             avg_both = (avg1 + avg2) / 2
-            
+
             if avg_both > 0:
                 diff_pct = abs(avg1 - avg2) / avg_both
             else:
                 diff_pct = 0
-            
+
+            # Never merge segments with opposite terrain character:
+            # climbing vs descending, or either vs flat
+            flat_threshold = 1.0  # % grade considered "flat"
+            avg_grade1 = np.mean(grades[start1:end1]) if end1 > start1 else 0
+            avg_grade2 = np.mean(grades[start2:end2]) if end2 > start2 else 0
+
+            def terrain_class(g):
+                if g > flat_threshold:
+                    return 1   # climbing
+                elif g < -flat_threshold:
+                    return -1  # descending
+                else:
+                    return 0   # flat
+
+            if terrain_class(avg_grade1) != terrain_class(avg_grade2):
+                continue  # Different terrain types — never merge
+
             # Only merge if within threshold AND it's the smallest difference
             if diff_pct <= threshold and diff_pct < best_diff:
                 best_diff = diff_pct
                 best_merge = i + 1
-        
+
         if best_merge is not None:
             boundaries.pop(best_merge)
             changed = True
-    
+
     return boundaries
 
 
@@ -432,10 +464,11 @@ def auto_segment(
         return []
     
     powers = np.array([p.power_w for p in sim_result.points])
-    
+    grades = np.array([p.grade_pct for p in course.points])
+
     # Step 1: Find gradient inflection points (kinks)
-    kinks = find_gradient_kinks(course, smoothing_window=11, derivative_threshold=0.5)
-    
+    kinks = find_gradient_kinks(course, smoothing_window=7, derivative_threshold=0.5)
+
     # Step 2: Create initial segment boundaries from kinks
     if kinks:
         boundaries = segments_from_kinks(course, kinks, min_segment_m)
@@ -448,9 +481,10 @@ def auto_segment(
             if dist_since_last >= initial_len:
                 boundaries.append(i)
         boundaries.append(n_points)
-    
+
     # Step 3: Iteratively merge segments with similar power (<= 4% difference)
-    boundaries = merge_similar_segments(boundaries, powers, threshold=0.04)
+    # Grade-sign constraint prevents merging fundamentally different terrain types
+    boundaries = merge_similar_segments(boundaries, powers, grades, threshold=0.04)
     
     # Step 4: Merge segments shorter than minimum duration
     if min_segment_duration_s > 0:

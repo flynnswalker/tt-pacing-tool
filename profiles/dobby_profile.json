@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "_notes": "Profile for dad: 61yo, 80x Ironman, 5:45 IM bike split, 5'10\" 165lb. Aerobic-dominant, flat PDC curve, low sprint power.",
+  "rider": {
+    "rider_weight": 74.8,
+    "bike_weight": 9.0,
+    "mass": 83.8,
+    "ftp": 230,
+    "hr_max": 162
+  },
+  "anchors": {
+    "5": 490,
+    "60": 330,
+    "300": 270,
+    "1200": 245,
+    "3600": 230
+  },
+  "equipment": {
+    "bike_type": "tt",
+    "cda_aero": 0.24,
+    "cda_non_aero": 0.30,
+    "cda_road": 0.32,
+    "grade_threshold": 5.0,
+    "speed_threshold_ms": 6.11,
+    "crr": 0.0032
+  },
+  "environment": {
+    "use_forecast": false,
+    "temp": 20.0,
+    "pressure": 1013.0,
+    "humidity": 50,
+    "wind_speed_ms": 0.0,
+    "wind_dir": 0
+  },
+  "advanced": {
+    "smoothing_window": 5,
+    "regularization": 0.5,
+    "grade_seg_threshold": 2.0,
+    "min_segment_m": 200,
+    "min_segment_duration_s": 30,
+    "target_segments": 6
+  }
+}

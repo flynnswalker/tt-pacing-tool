@@ -54,25 +54,19 @@ def init_session_state():
         st.session_state.segments = None
     if 'loaded_profile' not in st.session_state:
         st.session_state.loaded_profile = None
+    if 'panel_minimized' not in st.session_state:
+        st.session_state.panel_minimized = False
 
 
 def get_sample_courses() -> dict:
-    """
-    Scan sample_data/ folder for GPX files.
-    
-    Users can add their own real GPX files to this folder and they'll
-    appear in the dropdown. Download from Strava, RideWithGPS, etc.
-    """
+    """Scan sample_data/ folder for GPX files."""
     sample_dir = "sample_data"
     courses = {}
-    
     if os.path.exists(sample_dir):
         for filename in sorted(os.listdir(sample_dir)):
             if filename.lower().endswith('.gpx'):
-                # Create a friendly name from filename
                 name = filename[:-4].replace('_', ' ').replace('-', ' ').title()
                 courses[name] = os.path.join(sample_dir, filename)
-    
     return courses
 
 
@@ -82,6 +76,18 @@ def get_sample_gpx(filepath: str) -> str:
         with open(filepath, 'r') as f:
             return f.read()
     return None
+
+
+def get_sample_profiles() -> dict:
+    """Scan profiles/ folder for JSON profile files."""
+    profile_dir = "profiles"
+    profiles = {}
+    if os.path.exists(profile_dir):
+        for filename in sorted(os.listdir(profile_dir)):
+            if filename.lower().endswith('.json'):
+                name = filename[:-5].replace('_', ' ').replace('-', ' ').title()
+                profiles[name] = os.path.join(profile_dir, filename)
+    return profiles
 
 
 def create_user_profile(rider: dict, anchors: dict, equipment: dict, environment: dict, advanced: dict) -> dict:
@@ -101,6 +107,58 @@ def profile_to_json(profile: dict) -> str:
     return json.dumps(profile, indent=2)
 
 
+def apply_profile_defaults(profile: dict):
+    """Write profile values into session state widget keys before widgets render."""
+    rider = profile.get('rider', {})
+    anchors = profile.get('anchors', {})
+    equipment = profile.get('equipment', {})
+    environment = profile.get('environment', {})
+    advanced = profile.get('advanced', {})
+
+    def _a(key):  # anchor lookup handles int or str keys
+        return anchors.get(key, anchors.get(str(key)))
+
+    # Rider
+    if 'rider_weight' in rider: st.session_state['w_rider_weight'] = float(rider['rider_weight'])
+    if 'bike_weight' in rider:  st.session_state['w_bike_weight']  = float(rider['bike_weight'])
+    if 'ftp'          in rider: st.session_state['w_ftp']           = int(rider['ftp'])
+    if 'hr_max'       in rider: st.session_state['w_hr_max']        = int(rider['hr_max'])
+
+    # Power anchors
+    if _a(5):    st.session_state['w_p5s']  = int(_a(5))
+    if _a(60):   st.session_state['w_p1m']  = int(_a(60))
+    if _a(300):  st.session_state['w_p5m']  = int(_a(300))
+    if _a(1200): st.session_state['w_p20m'] = int(_a(1200))
+    if _a(3600): st.session_state['w_p60m'] = int(_a(3600))
+
+    # Equipment
+    bike_type = equipment.get('bike_type', 'tt')
+    st.session_state['w_bike_type'] = 'TT Bike' if bike_type == 'tt' else 'Road Bike'
+    if 'cda_aero'          in equipment: st.session_state['w_cda_aero']        = float(equipment['cda_aero'])
+    if 'cda_non_aero'      in equipment: st.session_state['w_cda_non_aero']    = float(equipment['cda_non_aero'])
+    if 'cda_road'          in equipment: st.session_state['w_cda_road']         = float(equipment['cda_road'])
+    if 'grade_threshold'   in equipment: st.session_state['w_grade_threshold']  = float(equipment['grade_threshold'])
+    if 'speed_threshold_ms' in equipment:
+        st.session_state['w_speed_threshold'] = float(equipment['speed_threshold_ms'] * 3.6)
+    if 'crr' in equipment: st.session_state['w_crr'] = float(equipment['crr'])
+
+    # Advanced
+    if 'smoothing_window'      in advanced: st.session_state['w_smoothing']         = int(advanced['smoothing_window'])
+    if 'regularization'        in advanced: st.session_state['w_regularization']    = float(advanced['regularization'])
+    if 'grade_seg_threshold'   in advanced: st.session_state['w_grade_seg']         = float(advanced['grade_seg_threshold'])
+    if 'min_segment_m'         in advanced: st.session_state['w_min_seg_m']         = int(advanced['min_segment_m'])
+    if 'min_segment_duration_s' in advanced: st.session_state['w_min_seg_dur']      = int(advanced['min_segment_duration_s'])
+    if 'target_segments'       in advanced: st.session_state['w_target_segs']       = int(advanced['target_segments'])
+
+    # Environment
+    if not environment.get('use_forecast', False):
+        if 'temp'          in environment: st.session_state['w_temp']       = float(environment['temp'])
+        if 'pressure'      in environment: st.session_state['w_pressure']   = float(environment['pressure'])
+        if 'humidity'      in environment: st.session_state['w_humidity']   = int(environment['humidity'])
+        if 'wind_speed_ms' in environment: st.session_state['w_wind_speed'] = float(environment['wind_speed_ms'] * 3.6)
+        if 'wind_dir'      in environment: st.session_state['w_wind_dir']   = int(environment['wind_dir'])
+
+
 def format_time(seconds: float) -> str:
     """Format seconds as MM:SS or H:MM:SS."""
     if seconds < 3600:
@@ -114,300 +172,272 @@ def format_time(seconds: float) -> str:
         return f"{hours}:{mins:02d}:{secs:02d}"
 
 
-def sidebar_rider_params() -> dict:
-    """Render rider parameters in sidebar."""
-    st.sidebar.header("Rider Parameters")
-    
-    col1, col2 = st.sidebar.columns(2)
-    
-    with col1:
-        rider_weight = st.number_input(
-            "Rider (kg)",
-            min_value=40.0,
-            max_value=150.0,
-            value=80.0,
-            step=0.5,
-            help="Your body weight"
-        )
-    
-    with col2:
-        bike_weight = st.number_input(
-            "Bike+Gear (kg)",
-            min_value=5.0,
-            max_value=20.0,
-            value=8.0,
-            step=0.5,
-            help="Bike, shoes, helmet, bottles, etc."
-        )
-    
-    total_mass = rider_weight + bike_weight
-    st.sidebar.caption(f"Total system mass: {total_mass:.1f} kg")
-    
-    ftp = st.sidebar.number_input(
-        "FTP (W)",
-        min_value=100,
-        max_value=500,
-        value=350,
-        step=5,
-        help="Functional Threshold Power"
-    )
-    
-    # Show W/kg
-    w_per_kg = ftp / rider_weight
-    st.sidebar.caption(f"FTP: {w_per_kg:.2f} W/kg")
-    
-    hr_max = st.sidebar.number_input(
-        "Max HR",
-        min_value=150,
-        max_value=220,
-        value=195,
-        step=1,
-        help="Maximum heart rate"
-    )
-    
-    return {'mass': total_mass, 'rider_weight': rider_weight, 'bike_weight': bike_weight, 'ftp': ftp, 'hr_max': hr_max}
+def sidebar_inputs():
+    """Render all sidebar inputs as three tabs: Rider, Equipment, Course.
+    Returns (rider, anchors, equipment, environment, advanced, generate_clicked,
+             compare_clicked, alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero,
+             save_placeholder)
+    """
+    # ── Profile loading: apply any pending profile before widgets render ──
+    if st.session_state.get('pending_profile'):
+        apply_profile_defaults(st.session_state.pop('pending_profile'))
 
+    tab_course, tab_rider, tab_equip = st.tabs(["Course", "Rider", "Equipment"])
 
-def sidebar_power_anchors(ftp: float) -> dict:
-    """Render power anchor inputs in sidebar."""
-    st.sidebar.header("Power Anchors")
-    
-    use_defaults = st.sidebar.checkbox("Use defaults from FTP", value=False)
-    
-    if use_defaults:
-        anchors = default_anchors_from_ftp(ftp)
-        st.sidebar.caption(f"5s: {anchors[5]:.0f}W | 1m: {anchors[60]:.0f}W | 5m: {anchors[300]:.0f}W")
-        st.sidebar.caption(f"20m: {anchors[1200]:.0f}W | 60m: {anchors[3600]:.0f}W")
-    else:
-        col1, col2 = st.sidebar.columns(2)
-        
-        with col1:
-            p5s = st.number_input("5s", min_value=100, max_value=2000, value=1300)
-            p1m = st.number_input("1m", min_value=100, max_value=1500, value=585)
-            p5m = st.number_input("5m", min_value=100, max_value=800, value=415)
-        
-        with col2:
-            p20m = st.number_input("20m", min_value=100, max_value=600, value=357)
-            p60m = st.number_input("60m", min_value=100, max_value=500, value=337)
-        
-        anchors = {5: p5s, 60: p1m, 300: p5m, 1200: p20m, 3600: p60m}
-    
-    # CSV import option
-    uploaded_csv = st.sidebar.file_uploader("Or import CSV", type=['csv'], key='anchor_csv')
-    if uploaded_csv:
-        try:
-            df = pd.read_csv(uploaded_csv)
-            if 'duration_s' in df.columns and 'power_w' in df.columns:
-                anchors = dict(zip(df['duration_s'].astype(int), df['power_w']))
-                st.sidebar.success(f"Loaded {len(anchors)} anchors from CSV")
-        except Exception as e:
-            st.sidebar.error(f"Error loading CSV: {e}")
-    
-    return anchors
+    # ── COURSE TAB ───────────────────────────────────────────────────
+    with tab_course:
+        sample_courses = get_sample_courses()
+        if sample_courses:
+            course_options = ["-- Select Course --"] + list(sample_courses.keys())
+            selected_sample = st.selectbox("Saved courses", course_options,
+                                           key="sample_course", label_visibility="collapsed")
+            if selected_sample != "-- Select Course --":
+                gpx_content = get_sample_gpx(sample_courses[selected_sample])
+                if gpx_content:
+                    try:
+                        # smoothing_window not yet known here; use session state or default
+                        sw = st.session_state.get('w_smoothing', 5)
+                        course_obj = load_course_from_string(gpx_content, step_m=50.0, smoothing_window=sw)
+                        st.session_state.course = course_obj
+                        st.success(f"Loaded: {course_obj.total_distance_m/1000:.1f} km")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        else:
+            st.caption("Add .gpx files to sample_data/ to see them here")
 
+        uploaded_gpx = st.file_uploader("Upload GPX", type=['gpx'], label_visibility="collapsed")
+        if uploaded_gpx:
+            try:
+                sw = st.session_state.get('w_smoothing', 5)
+                gpx_content = uploaded_gpx.read().decode('utf-8')
+                course_obj = load_course_from_string(gpx_content, step_m=50.0, smoothing_window=sw)
+                st.session_state.course = course_obj
+                st.success(f"Loaded: {course_obj.total_distance_m/1000:.1f} km")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-def sidebar_equipment() -> dict:
-    """Render equipment parameters in sidebar."""
-    st.sidebar.header("Equipment")
-    
-    # Bike type selection
-    bike_type = st.sidebar.radio(
-        "Bike Type",
-        ["TT Bike", "Road Bike"],
-        index=0,
-        help="TT bike uses aero/non-aero position switching; Road bike uses single CdA"
-    )
-    
-    with st.sidebar.expander("Aerodynamics", expanded=False):
-        if bike_type == "TT Bike":
+        st.divider()
+        st.markdown("**Weather**")
+        use_forecast = st.checkbox("Fetch weather forecast", value=False, key='w_use_forecast',
+                                   help="Only works within ~14 days of race date")
+        if use_forecast:
+            default_date = datetime(2026, 5, 16).date()
+            race_date = st.date_input("Race Date", value=default_date)
+            race_time = st.time_input("Start Time", value=datetime.strptime("09:15", "%H:%M").time())
+            race_datetime = datetime.combine(race_date, race_time)
+            days_out = (race_date - datetime.now().date()).days
+            if days_out > 14:
+                st.warning(f"Race is {days_out} days away — forecast may be unreliable.")
+            environment = {'use_forecast': True, 'race_datetime': race_datetime}
+        else:
             col1, col2 = st.columns(2)
             with col1:
-                cda_aero = st.number_input(
-                    "CdA Aero (m²)",
-                    min_value=0.15,
-                    max_value=0.35,
-                    value=0.22,
-                    step=0.01,
-                    help="Drag area in full aero position (skis/extensions)"
-                )
+                temp       = st.number_input("Temp (°C)",      value=20.0,   step=1.0, key='w_temp')
+                pressure   = st.number_input("Pressure (hPa)", value=1013.0, step=1.0, key='w_pressure')
+                humidity   = st.number_input("Humidity (%)",   value=50,     step=1,   key='w_humidity',
+                                             min_value=0, max_value=100)
             with col2:
-                cda_non_aero = st.number_input(
-                    "CdA Bars (m²)",
-                    min_value=0.20,
-                    max_value=0.40,
-                    value=0.28,
-                    step=0.01,
-                    help="Drag area on bars/drops (climbing position)"
-                )
-            
-            grade_threshold = st.number_input(
-                "Grade Threshold (%)",
-                min_value=0.0,
-                max_value=15.0,
-                value=5.0,
-                step=0.5,
-                help="Switch to bars CdA above this grade"
-            )
-            
-            speed_threshold = st.number_input(
-                "Speed Threshold (km/h)",
-                min_value=10.0,
-                max_value=40.0,
-                value=22.0,
-                step=1.0,
-                help="Switch to bars CdA below this speed"
-            )
-            
-            cda_road = 0.32  # Default, not used for TT
+                wind_speed = st.number_input("Wind (km/h)",  value=0.0, step=1.0, key='w_wind_speed',
+                                             min_value=0.0)
+                wind_dir   = st.number_input("Wind Dir (°)", value=0,   step=1,   key='w_wind_dir',
+                                             min_value=0, max_value=359,
+                                             help="Direction wind comes FROM (0=N, 90=E)")
+            environment = {
+                'use_forecast': False,
+                'temp': temp, 'pressure': pressure, 'humidity': humidity,
+                'wind_speed_ms': wind_speed / 3.6, 'wind_dir': wind_dir,
+            }
+
+    # ── RIDER TAB ────────────────────────────────────────────────────
+    with tab_rider:
+        st.markdown("**Load Profile**")
+        sample_profiles = get_sample_profiles()
+        if sample_profiles:
+            prof_options = ["-- Select --"] + list(sample_profiles.keys())
+            selected_prof = st.selectbox("Saved profiles", prof_options,
+                                         key="profile_dropdown", label_visibility="collapsed")
+            if selected_prof != "-- Select --":
+                if st.session_state.get('last_applied_profile') != selected_prof:
+                    with open(sample_profiles[selected_prof], 'r', encoding='utf-8') as f:
+                        pdata = json.load(f)
+                    st.session_state['pending_profile'] = pdata
+                    st.session_state['last_applied_profile'] = selected_prof
+                    st.rerun()
         else:
-            # Road bike - single CdA
-            cda_road = st.number_input(
-                "CdA (m²)",
-                min_value=0.25,
-                max_value=0.45,
-                value=0.32,
-                step=0.01,
-                help="Drag area (single position for road bike)"
-            )
-            cda_aero = 0.22  # Defaults, not used
-            cda_non_aero = 0.28
-            grade_threshold = 5.0
-            speed_threshold = 22.0
-    
-    with st.sidebar.expander("Rolling Resistance", expanded=False):
-        crr = st.number_input(
-            "Crr",
-            min_value=0.002,
-            max_value=0.010,
-            value=0.0029,
-            step=0.0001,
-            format="%.4f",
-            help="Rolling resistance coefficient"
-        )
-    
-    return {
-        'bike_type': 'tt' if bike_type == "TT Bike" else 'road',
-        'cda_aero': cda_aero,
-        'cda_non_aero': cda_non_aero,
-        'cda_road': cda_road,
-        'grade_threshold': grade_threshold,
-        'speed_threshold_ms': speed_threshold / 3.6,
-        'crr': crr
+            st.caption("Add .json files to profiles/ to see them here")
+
+        uploaded_profile = st.file_uploader("Upload profile (.json)", type=['json'],
+                                             key='profile_upload', label_visibility="collapsed")
+        if uploaded_profile:
+            upload_id = uploaded_profile.name + str(uploaded_profile.size)
+            if st.session_state.get('last_upload_id') != upload_id:
+                try:
+                    pdata = json.loads(uploaded_profile.read().decode('utf-8'))
+                    st.session_state['pending_profile'] = pdata
+                    st.session_state['last_upload_id'] = upload_id
+                    st.session_state['last_applied_profile'] = None
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error loading profile: {e}")
+
+        st.divider()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            rider_weight = st.number_input("Rider (kg)", min_value=40.0, max_value=150.0,
+                                           value=80.0, step=0.5, key='w_rider_weight')
+        with col2:
+            bike_weight = st.number_input("Bike+Gear (kg)", min_value=5.0, max_value=20.0,
+                                          value=8.0, step=0.5, key='w_bike_weight')
+        total_mass = rider_weight + bike_weight
+        st.caption(f"Total system mass: {total_mass:.1f} kg")
+
+        ftp = st.number_input("FTP (W)", min_value=100, max_value=500,
+                               value=350, step=5, key='w_ftp')
+        st.caption(f"{ftp/rider_weight:.2f} W/kg")
+
+        hr_max = st.number_input("Max HR", min_value=130, max_value=220,
+                                  value=195, step=1, key='w_hr_max')
+
+        st.divider()
+        st.markdown("**Power Anchors**")
+        use_defaults = st.checkbox("Use defaults from FTP", value=False, key='w_anchor_defaults')
+        if use_defaults:
+            anchors = default_anchors_from_ftp(ftp)
+            st.caption(f"5s: {anchors[5]:.0f}W | 1m: {anchors[60]:.0f}W | 5m: {anchors[300]:.0f}W")
+            st.caption(f"20m: {anchors[1200]:.0f}W | 60m: {anchors[3600]:.0f}W")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                p5s  = st.number_input("5s",  min_value=100, max_value=2000, value=1300, key='w_p5s')
+                p1m  = st.number_input("1m",  min_value=100, max_value=1500, value=585,  key='w_p1m')
+                p5m  = st.number_input("5m",  min_value=100, max_value=800,  value=415,  key='w_p5m')
+            with col2:
+                p20m = st.number_input("20m", min_value=100, max_value=600,  value=357,  key='w_p20m')
+                p60m = st.number_input("60m", min_value=100, max_value=500,  value=337,  key='w_p60m')
+            anchors = {5: p5s, 60: p1m, 300: p5m, 1200: p20m, 3600: p60m}
+            uploaded_csv = st.file_uploader("Import CSV", type=['csv'], key='anchor_csv')
+            if uploaded_csv:
+                try:
+                    df = pd.read_csv(uploaded_csv)
+                    if 'duration_s' in df.columns and 'power_w' in df.columns:
+                        anchors = dict(zip(df['duration_s'].astype(int), df['power_w']))
+                        st.success(f"Loaded {len(anchors)} anchors")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        st.divider()
+        st.markdown("**Save Profile**")
+        save_placeholder = st.empty()
+
+    rider = {
+        'mass': total_mass, 'rider_weight': rider_weight,
+        'bike_weight': bike_weight, 'ftp': ftp, 'hr_max': hr_max,
     }
 
+    # ── EQUIPMENT TAB ─────────────────────────────────────────────────
+    with tab_equip:
+        bike_type_label = st.radio("Bike Type", ["TT Bike", "Road Bike"], index=0,
+                                   key='w_bike_type',
+                                   help="TT: aero/non-aero switching; Road: single CdA")
 
-def sidebar_environment() -> dict:
-    """Render environment settings in sidebar."""
-    st.sidebar.header("Environment")
-    
-    use_forecast = st.sidebar.checkbox(
-        "Fetch weather forecast", 
-        value=False,
-        help="Only works for dates within ~14 days. For future races, use manual weather."
+        with st.expander("Aerodynamics", expanded=True):
+            if bike_type_label == "TT Bike":
+                col1, col2 = st.columns(2)
+                with col1:
+                    cda_aero = st.number_input("CdA Aero (m²)", min_value=0.15, max_value=0.35,
+                                               value=0.22, step=0.01, key='w_cda_aero',
+                                               help="Full aero position")
+                with col2:
+                    cda_non_aero = st.number_input("CdA Bars (m²)", min_value=0.20, max_value=0.40,
+                                                   value=0.28, step=0.01, key='w_cda_non_aero',
+                                                   help="On bars/drops")
+                grade_threshold = st.number_input("Grade Threshold (%)", min_value=0.0, max_value=15.0,
+                                                  value=5.0, step=0.5, key='w_grade_threshold',
+                                                  help="Switch to bars CdA above this grade")
+                speed_threshold = st.number_input("Speed Threshold (km/h)", min_value=10.0, max_value=40.0,
+                                                  value=22.0, step=1.0, key='w_speed_threshold',
+                                                  help="Switch to bars CdA below this speed")
+                cda_road = 0.32
+            else:
+                cda_road = st.number_input("CdA (m²)", min_value=0.25, max_value=0.45,
+                                           value=0.32, step=0.01, key='w_cda_road')
+                cda_aero = 0.22
+                cda_non_aero = 0.28
+                grade_threshold = 5.0
+                speed_threshold = 22.0
+
+        with st.expander("Rolling Resistance"):
+            crr = st.number_input("Crr", min_value=0.002, max_value=0.010,
+                                  value=0.0029, step=0.0001, format="%.4f", key='w_crr')
+
+        with st.expander("Advanced Settings"):
+            smoothing_window = st.number_input("Elevation Smoothing Window", min_value=3, max_value=15,
+                                               value=5, step=2, key='w_smoothing')
+            regularization = st.slider("Pacing Smoothness", min_value=0.01, max_value=2.0,
+                                       value=0.5, step=0.05, key='w_regularization',
+                                       help="Higher = smoother power changes between segments")
+            grade_seg_threshold = st.number_input("Segment Grade Threshold (%)", min_value=0.5,
+                                                  max_value=5.0, value=2.0, step=0.5, key='w_grade_seg')
+            min_segment_m = st.number_input("Min Segment Length (m)", min_value=100, max_value=2000,
+                                            value=200, step=50, key='w_min_seg_m')
+            min_segment_duration_s = st.number_input("Min Segment Duration (s)", min_value=0,
+                                                     max_value=120, value=30, step=5, key='w_min_seg_dur')
+            target_segments = st.number_input("Target # of Segments", min_value=3, max_value=15,
+                                              value=6, step=1, key='w_target_segs')
+
+        with st.expander("Compare Bikes"):
+            st.caption("Compare TT bike vs Road bike for this course")
+            if bike_type_label == "TT Bike":
+                st.write("**Road Bike Config (alternate):**")
+                alt_bike_weight = st.number_input("Road Bike Weight (kg)", min_value=5.0, max_value=15.0,
+                                                  value=7.5, step=0.5, key="alt_bike_weight")
+                alt_cda = st.number_input("Road Bike CdA (m²)", min_value=0.25, max_value=0.45,
+                                          value=0.32, step=0.01, key="alt_cda")
+                alt_cda_aero = alt_cda_non_aero = None
+            else:
+                st.write("**TT Bike Config (alternate):**")
+                alt_bike_weight = st.number_input("TT Bike Weight (kg)", min_value=5.0, max_value=15.0,
+                                                  value=8.5, step=0.5, key="alt_bike_weight")
+                col1, col2 = st.columns(2)
+                with col1:
+                    alt_cda_aero = st.number_input("CdA Aero (m²)", min_value=0.15, max_value=0.35,
+                                                   value=0.22, step=0.01, key="alt_cda_aero")
+                with col2:
+                    alt_cda_non_aero = st.number_input("CdA Bars (m²)", min_value=0.20, max_value=0.40,
+                                                        value=0.28, step=0.01, key="alt_cda_non_aero")
+                alt_cda = None
+            compare_clicked = st.button("Compare Bikes", use_container_width=True)
+
+    equipment = {
+        'bike_type': 'tt' if bike_type_label == "TT Bike" else 'road',
+        'cda_aero': cda_aero, 'cda_non_aero': cda_non_aero, 'cda_road': cda_road,
+        'grade_threshold': grade_threshold, 'speed_threshold_ms': speed_threshold / 3.6, 'crr': crr,
+    }
+    advanced = {
+        'smoothing_window': smoothing_window, 'regularization': regularization,
+        'grade_seg_threshold': grade_seg_threshold, 'min_segment_m': min_segment_m,
+        'min_segment_duration_s': min_segment_duration_s, 'target_segments': target_segments,
+    }
+
+    # ── Generate Plan button ──────────────────────────────────────────
+    st.divider()
+    generate_clicked = st.button("Generate Plan", type="primary", use_container_width=True)
+
+    # ── Fill save-profile placeholder ────────────────────────────────
+    current_profile = create_user_profile(rider, anchors, equipment, environment, advanced)
+    save_placeholder.download_button(
+        "Download Profile",
+        profile_to_json(current_profile),
+        file_name="tt_pacing_profile.json",
+        mime="application/json",
+        use_container_width=True,
     )
-    
-    if use_forecast:
-        # Default to a realistic near-future date
-        default_date = datetime(2026, 5, 16).date()
-        race_date = st.sidebar.date_input("Race Date", value=default_date)
-        race_time = st.sidebar.time_input("Start Time", value=datetime.strptime("09:15", "%H:%M").time())
-        race_datetime = datetime.combine(race_date, race_time)
-        
-        # Warn if date is too far out
-        days_out = (race_date - datetime.now().date()).days
-        if days_out > 14:
-            st.sidebar.warning(
-                f"⚠️ Race is {days_out} days away. Weather forecasts are only reliable "
-                f"for ~14 days. Consider using manual weather settings."
-            )
-        
-        return {
-            'use_forecast': True,
-            'race_datetime': race_datetime
-        }
-    else:
-        with st.sidebar.expander("Manual Weather", expanded=True):
-            temp = st.number_input("Temperature (°C)", value=20.0, step=1.0)
-            pressure = st.number_input("Pressure (hPa)", value=1013.0, step=1.0)
-            humidity = st.number_input("Humidity (%)", min_value=0, max_value=100, value=50)
-            wind_speed = st.number_input("Wind Speed (km/h)", min_value=0.0, value=0.0, step=1.0)
-            wind_dir = st.number_input("Wind Direction (°)", min_value=0, max_value=359, value=0,
-                                       help="Direction wind is coming FROM (0=N, 90=E)")
-        
-        return {
-            'use_forecast': False,
-            'temp': temp,
-            'pressure': pressure,
-            'humidity': humidity,
-            'wind_speed_ms': wind_speed / 3.6,
-            'wind_dir': wind_dir
-        }
+
+    return rider, anchors, equipment, environment, advanced, generate_clicked, \
+           compare_clicked, alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero
 
 
-def sidebar_advanced() -> dict:
-    """Render advanced settings in sidebar."""
-    with st.sidebar.expander("Advanced Settings", expanded=False):
-        smoothing_window = st.number_input(
-            "Elevation Smoothing Window",
-            min_value=3,
-            max_value=15,
-            value=5,
-            step=2,
-            help="Points for Savitzky-Golay filter"
-        )
-        
-        regularization = st.slider(
-            "Pacing Smoothness",
-            min_value=0.01,
-            max_value=2.0,
-            value=0.5,
-            step=0.05,
-            help="Higher = smoother power changes (less variation between segments)"
-        )
-        
-        grade_seg_threshold = st.number_input(
-            "Segment Grade Threshold (%)",
-            min_value=0.5,
-            max_value=5.0,
-            value=2.0,
-            step=0.5,
-            help="Grade change to trigger new segment"
-        )
-        
-        min_segment_m = st.number_input(
-            "Min Segment Length (m)",
-            min_value=100,
-            max_value=2000,
-            value=200,
-            step=50
-        )
-        
-        min_segment_duration_s = st.number_input(
-            "Min Segment Duration (s)",
-            min_value=0,
-            max_value=120,
-            value=30,
-            step=5,
-            help="Segments shorter than this will be merged with neighbors"
-        )
-        
-        target_segments = st.number_input(
-            "Target # of Segments",
-            min_value=3,
-            max_value=15,
-            value=6,
-            step=1,
-            help="Aim for this many segments (easier to memorize)"
-        )
-    
-    return {
-        'smoothing_window': smoothing_window,
-        'regularization': regularization,
-        'grade_seg_threshold': grade_seg_threshold,
-        'min_segment_m': min_segment_m,
-        'min_segment_duration_s': min_segment_duration_s,
-        'target_segments': target_segments
-    }
 
 
 def render_course_tab(course: Course):
@@ -527,6 +557,90 @@ def render_plan_tab(result: OptimizationResult, course: Course):
     st.subheader("Optimized vs Constant Power")
     fig = create_comparison_plot(course, result.simulation, result.baseline_simulation)
     st.plotly_chart(fig, use_container_width=True)
+
+
+def render_gearing_tab(segments: list, sim_result):
+    """Render the Gearing tab — cadence distribution for different min gear ratios."""
+    st.subheader("Gearing Analysis")
+    st.caption("Shows % of riding time spent in each cadence range for different minimum gear ratios (easiest gear).")
+
+    # Controls
+    col1, col2 = st.columns(2)
+    with col1:
+        wheel_circumference_m = st.number_input(
+            "Wheel circumference (m)", min_value=1.9, max_value=2.3,
+            value=2.096, step=0.001, format="%.3f",
+            help="700c x 25mm ≈ 2.096m"
+        )
+    with col2:
+        st.markdown("**Gear ratio** = chainring ÷ cog")
+
+    # Gear options: (label, ratio) sorted ascending by ratio
+    gear_options_raw = [
+        ("34/34", 34/34),
+        ("36/34", 36/34),
+        ("34/32", 34/32),
+        ("36/32", 36/32),
+        ("34/30", 34/30),
+        ("36/30", 36/30),
+        ("34/28", 34/28),
+        ("36/28", 36/28),
+        ("34/26", 34/26),
+        ("39/28", 39/28),
+        ("50/34", 50/34),
+    ]
+    gear_options_raw.sort(key=lambda x: x[1])
+    gear_options = {f"{label} ({ratio:.2f})": ratio for label, ratio in gear_options_raw}
+
+    cadence_buckets = [
+        ("<50",  0,  50),
+        ("50–60", 50, 60),
+        ("60–70", 60, 70),
+        ("70–80", 70, 80),
+        ("80–90", 80, 90),
+        ("90+",  90, float("inf")),
+    ]
+
+    # Build time-per-point array across all segment points
+    # Use segment_time_s (time spent traversing each point interval)
+    all_speeds = []   # m/s
+    all_times = []    # seconds per interval
+
+    for seg in segments:
+        sim_points = sim_result.points[seg.start_idx:seg.end_idx]
+        for p in sim_points:
+            all_speeds.append(p.speed_ms)
+            all_times.append(p.segment_time_s)
+
+    all_speeds = np.array(all_speeds)
+    all_times = np.array(all_times)
+    total_time = all_times.sum()
+
+    if total_time == 0:
+        st.warning("No time data available.")
+        return
+
+    # Build table: rows = gear options, columns = cadence buckets
+    rows = []
+    for label, ratio in gear_options.items():
+        development = ratio * wheel_circumference_m  # metres per revolution
+        # cadence (rpm) = speed (m/s) / development (m/rev) * 60
+        cadences = all_speeds / development * 60
+
+        row = {"Min Gear": label}
+        for bucket_label, lo, hi in cadence_buckets:
+            mask = (cadences >= lo) & (cadences < hi)
+            secs = int(all_times[mask].sum())
+            row[bucket_label] = f"{secs // 60}:{secs % 60:02d}"
+        rows.append(row)
+
+    df = pd.DataFrame(rows).set_index("Min Gear")
+    st.dataframe(df, use_container_width=True)
+
+    st.caption(
+        "Time (m:ss) spent in each cadence range, assuming you are always in your minimum (easiest) gear. "
+        "High time in <60 rpm buckets suggests you may need an easier gear for this course."
+    )
 
 
 def render_segments_tab(course: Course, result: OptimizationResult, advanced: dict):
@@ -673,149 +787,59 @@ def render_guidance_tab(segments: list, rider: dict):
 def main():
     """Main application entry point."""
     init_session_state()
-    
+
     st.title("🚴 TT Pacing Tool")
     st.caption("Time-optimal pacing for time trials and hill climbs")
-    
-    # Sidebar inputs
-    rider = sidebar_rider_params()
-    anchors = sidebar_power_anchors(rider['ftp'])
-    equipment = sidebar_equipment()
-    environment = sidebar_environment()
-    advanced = sidebar_advanced()
-    
-    # GPX upload
-    st.sidebar.header("Course")
-    
-    # Sample courses dropdown - scans sample_data/ folder
-    sample_courses = get_sample_courses()
-    
-    if sample_courses:
-        sample_options = ["-- Select Sample --"] + list(sample_courses.keys())
-        selected_sample = st.sidebar.selectbox("Load Sample Course", sample_options, key="sample_course")
-        
-        if selected_sample != "-- Select Sample --":
-            gpx_content = get_sample_gpx(sample_courses[selected_sample])
-            if gpx_content:
-                try:
-                    course = load_course_from_string(
-                        gpx_content,
-                        step_m=50.0,
-                        smoothing_window=advanced['smoothing_window']
-                    )
-                    st.session_state.course = course
-                    st.sidebar.success(f"Loaded sample: {course.total_distance_m/1000:.1f} km")
-                except Exception as e:
-                    st.sidebar.error(f"Error loading sample: {e}")
+
+    has_plan = st.session_state.optimization_result is not None
+    minimized = st.session_state.panel_minimized
+
+    if minimized:
+        col_in, col_out = st.columns([1, 40])
+    elif has_plan:
+        col_in, col_out = st.columns([1, 3])
     else:
-        st.sidebar.caption("Add .gpx files to sample_data/ folder to see them here")
-    
-    # Or upload custom GPX
-    uploaded_gpx = st.sidebar.file_uploader("Or Upload GPX File", type=['gpx'])
-    
-    if uploaded_gpx:
-        try:
-            gpx_content = uploaded_gpx.read().decode('utf-8')
-            course = load_course_from_string(
-                gpx_content,
-                step_m=50.0,
-                smoothing_window=advanced['smoothing_window']
-            )
-            st.session_state.course = course
-            st.sidebar.success(f"Loaded: {course.total_distance_m/1000:.1f} km")
-        except Exception as e:
-            st.sidebar.error(f"Error loading GPX: {e}")
-    
-    # Generate button
-    generate_clicked = st.sidebar.button("Generate Plan", type="primary", use_container_width=True)
-    
-    # Bike comparison feature
-    with st.sidebar.expander("Compare Bikes", expanded=False):
-        st.caption("Compare TT bike vs Road bike for this course")
-        
-        # Alternate bike config
-        if equipment['bike_type'] == 'tt':
-            st.write("**Road Bike Config (alternate):**")
-            alt_bike_weight = st.number_input(
-                "Road Bike Weight (kg)",
-                min_value=5.0,
-                max_value=15.0,
-                value=7.5,
-                step=0.5,
-                key="alt_bike_weight"
-            )
-            alt_cda = st.number_input(
-                "Road Bike CdA (m²)",
-                min_value=0.25,
-                max_value=0.45,
-                value=0.32,
-                step=0.01,
-                key="alt_cda"
-            )
+        col_in, col_out = st.columns([1, 1])
+
+    with col_in:
+        # Toggle button — always visible
+        toggle_label = "▶" if minimized else "◀"
+        if st.button(toggle_label, help="Expand/collapse input panel", use_container_width=True):
+            st.session_state.panel_minimized = not minimized
+            st.rerun()
+
+        if not minimized:
+            (rider, anchors, equipment, environment, advanced,
+             generate_clicked, compare_clicked,
+             alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero) = sidebar_inputs()
+
+            # Auto-minimize after Generate Plan is clicked
+            if generate_clicked:
+                st.session_state.panel_minimized = True
         else:
-            st.write("**TT Bike Config (alternate):**")
-            alt_bike_weight = st.number_input(
-                "TT Bike Weight (kg)",
-                min_value=5.0,
-                max_value=15.0,
-                value=8.5,
-                step=0.5,
-                key="alt_bike_weight"
-            )
-            col1, col2 = st.columns(2)
-            with col1:
-                alt_cda_aero = st.number_input(
-                    "CdA Aero (m²)",
-                    min_value=0.15,
-                    max_value=0.35,
-                    value=0.22,
-                    step=0.01,
-                    key="alt_cda_aero"
-                )
-            with col2:
-                alt_cda_non_aero = st.number_input(
-                    "CdA Bars (m²)",
-                    min_value=0.20,
-                    max_value=0.40,
-                    value=0.28,
-                    step=0.01,
-                    key="alt_cda_non_aero"
-                )
-            alt_cda = None  # Not used for TT
-        
-        compare_clicked = st.button("Compare Bikes", use_container_width=True)
-    
-    # Profile save/load
-    st.sidebar.header("User Profile")
-    
-    with st.sidebar.expander("Save/Load Profile", expanded=False):
-        st.caption("Save your settings to quickly reload later")
-        
-        # Save profile
-        current_profile = create_user_profile(rider, anchors, equipment, environment, advanced)
-        profile_json = profile_to_json(current_profile)
-        
-        st.download_button(
-            "Download Profile",
-            profile_json,
-            file_name="tt_pacing_profile.json",
-            mime="application/json",
-            use_container_width=True
-        )
-        
-        # Load profile
-        uploaded_profile = st.file_uploader("Load Profile", type=['json'], key='profile_upload')
-        if uploaded_profile:
-            try:
-                profile_data = json.loads(uploaded_profile.read().decode('utf-8'))
-                st.session_state.loaded_profile = profile_data
-                st.success("Profile loaded! Refresh page to apply.")
-                st.info("Settings from profile: " + 
-                       f"Mass={profile_data.get('rider', {}).get('mass', '?')}kg, " +
-                       f"FTP={profile_data.get('rider', {}).get('ftp', '?')}W")
-            except Exception as e:
-                st.error(f"Error loading profile: {e}")
-    
+            # Provide safe defaults so _main_content can still read session state
+            rider = {'mass': 88, 'rider_weight': 80, 'bike_weight': 8, 'ftp': 350, 'hr_max': 195}
+            anchors = {}
+            equipment = {'bike_type': 'tt', 'cda_aero': 0.22, 'cda_non_aero': 0.28,
+                         'cda_road': 0.32, 'grade_threshold': 5.0, 'speed_threshold_ms': 6.11, 'crr': 0.0029}
+            advanced = {'smoothing_window': 5, 'regularization': 0.5, 'grade_seg_threshold': 2.0,
+                        'min_segment_m': 200, 'min_segment_duration_s': 30, 'target_segments': 6}
+            environment = {'use_forecast': False, 'temp': 20, 'pressure': 1013,
+                           'humidity': 50, 'wind_speed_ms': 0, 'wind_dir': 0}
+            generate_clicked = compare_clicked = False
+            alt_bike_weight = alt_cda = alt_cda_aero = alt_cda_non_aero = None
+
+    with col_out:
+        _main_content(rider, anchors, equipment, environment, advanced,
+                      generate_clicked, compare_clicked,
+                      alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero)
+
+
+def _main_content(rider, anchors, equipment, environment, advanced,
+                  generate_clicked, compare_clicked,
+                  alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero):
+    """Render the right-hand results column."""
+
     if generate_clicked and st.session_state.course is not None:
         course = st.session_state.course
         
@@ -934,6 +958,7 @@ def main():
                 f"Optimization complete! Time: {result.total_time_s:.1f}s "
                 f"(saved {result.time_saved_s:.1f}s / {result.time_saved_pct:.1f}%)"
             )
+            st.rerun()
     
     # Handle bike comparison
     if compare_clicked and st.session_state.course is not None:
@@ -1049,99 +1074,77 @@ def main():
         return
     
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["Course", "Plan", "Segments", "Guidance"])
-    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Course", "Plan", "Segments", "Gearing", "Guidance"])
+
     with tab1:
         render_course_tab(course)
-    
+
     with tab2:
         if result:
             render_plan_tab(result, course)
         else:
             st.info("Click 'Generate Plan' to optimize your pacing")
-    
+
     with tab3:
         if result:
             render_segments_tab(course, result, advanced)
         else:
             st.info("Generate a plan first to see segments")
-    
+
     with tab4:
+        if segments and result:
+            render_gearing_tab(segments, result.simulation)
+        else:
+            st.info("Generate a plan first to see gearing analysis")
+
+    with tab5:
         if segments:
             render_guidance_tab(segments, rider)
         else:
             st.info("Generate a plan first to see race guidance")
     
-    # Export options in sidebar
+    # Export options (below results tabs)
     if result:
-        st.sidebar.header("Export")
-        
+        st.divider()
+        st.subheader("Export")
+        ecol1, ecol2 = st.columns(2)
+
         # CSV export
-        csv_buffer = io.StringIO()
         export_data = []
-        for i, (point, sim_point) in enumerate(zip(course.points, result.simulation.points)):
+        for point, sim_point in zip(course.points, result.simulation.points):
             export_data.append({
                 'distance_m': point.distance_m,
                 'elevation_m': point.elevation_m,
                 'grade_pct': point.grade_pct,
                 'target_power_w': sim_point.power_w,
                 'predicted_speed_kmh': sim_point.speed_ms * 3.6,
-                'cumulative_time_s': sim_point.time_s
+                'cumulative_time_s': sim_point.time_s,
             })
-        df = pd.DataFrame(export_data)
-        csv_data = df.to_csv(index=False)
-        
-        st.sidebar.download_button(
-            "Download Full Plan (CSV)",
-            csv_data,
-            file_name="pacing_plan.csv",
-            mime="text/csv"
-        )
-        
+        csv_data = pd.DataFrame(export_data).to_csv(index=False)
+        with ecol1:
+            st.download_button("Download Full Plan (CSV)", csv_data,
+                               file_name="pacing_plan.csv", mime="text/csv",
+                               use_container_width=True)
+
         # Garmin FIT workout export
         if segments:
-            st.sidebar.markdown("---")
-            st.sidebar.subheader("Garmin Workout")
-            
-            # Power range slider
-            power_range = st.sidebar.slider(
-                "Target Power Range (+/- W)",
-                min_value=5,
-                max_value=30,
-                value=10,
-                step=5,
-                help="Power target tolerance shown on Garmin"
-            )
-            
-            # Generate workout name from course
             workout_name = "TT Pacing"
             if hasattr(course, 'name') and course.name:
                 workout_name = course.name[:15]
-            
+            power_range = st.slider("Target Power Range (+/- W)", min_value=5, max_value=30,
+                                    value=10, step=5, help="Power target tolerance on Garmin")
             try:
-                fit_data = create_fit_workout(
-                    segments,
-                    workout_name=workout_name,
-                    power_range_watts=power_range
-                )
-                
-                st.sidebar.download_button(
-                    "Download Garmin Workout (.fit)",
-                    fit_data,
-                    file_name=f"{workout_name.replace(' ', '_')}_workout.fit",
-                    mime="application/octet-stream"
-                )
-                
-                # Show workout summary in expander
-                with st.sidebar.expander("Workout Preview"):
+                fit_data = create_fit_workout(segments, workout_name=workout_name,
+                                              power_range_watts=power_range)
+                with ecol2:
+                    st.download_button("Download Garmin Workout (.fit)", fit_data,
+                                       file_name=f"{workout_name.replace(' ', '_')}_workout.fit",
+                                       mime="application/octet-stream", use_container_width=True)
+                with st.expander("Workout Preview"):
                     st.text(get_workout_summary(segments))
-                    st.caption(
-                        "Transfer to Garmin via:\n"
-                        "1. Upload to Garmin Connect, or\n"
-                        "2. Copy to device `/Garmin/NewFiles/`"
-                    )
+                    st.caption("Transfer via Garmin Connect or copy to `/Garmin/NewFiles/`")
             except Exception as e:
-                st.sidebar.error(f"Error generating workout: {e}")
+                st.error(f"Error generating workout: {e}")
 
 
 if __name__ == "__main__":
