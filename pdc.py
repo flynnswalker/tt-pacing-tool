@@ -491,9 +491,12 @@ def get_check_windows(race_duration_s: float) -> List[int]:
     if race_duration_s > 5400:   # >90 min
         windows.append(5400)
     
-    # Always check a window at ~90% of race duration
+    # Check a window at ~90% of race duration, but only for longer races
+    # For short races (<10 min), the 300s window already covers the effort adequately.
+    # Adding a 90% window for a 9-10 min race creates a near-total-race average cap
+    # that prevents meaningful power variation on variable terrain.
     long_window = int(race_duration_s * 0.9)
-    if long_window > 300 and long_window not in windows:
+    if long_window > 600 and long_window not in windows:
         windows.append(long_window)
     
     return sorted(windows)
@@ -591,6 +594,139 @@ def compute_pdc_penalty(
         total_penalty += linear_penalty + quadratic_penalty
     
     return total_penalty
+
+
+def estimate_cp_wprime(pdc: 'PDCModel') -> Tuple[float, float]:
+    """
+    Estimate CP and W' from anchor points using the 2-parameter critical power model.
+
+    The extended 4-parameter model's cp/w_prime often gives poor physiological values
+    for flat PDC curves. This function uses the classic 2-parameter model:
+        P(t) = CP + W'/t
+    solved from two anchor points, which is the standard approach in cycling science.
+
+    Prefers the 5-min and 20-min anchors (most reliable for CP estimation).
+
+    Returns:
+        (cp, w_prime) tuple in (Watts, Joules)
+    """
+    anchors = pdc.anchors
+    if not anchors or len(anchors) < 2:
+        return pdc.cp, pdc.w_prime
+
+    sorted_durs = sorted(anchors.keys())
+
+    # Pick anchor pair: prefer 5min/20min, then two longest in the 1-60min range
+    if 300 in anchors and 1200 in anchors:
+        d1, d2 = 300, 1200
+    elif 60 in anchors and 300 in anchors:
+        d1, d2 = 60, 300
+    else:
+        # Use two longest
+        d1, d2 = sorted_durs[-2], sorted_durs[-1]
+
+    p1, p2 = anchors[d1], anchors[d2]
+
+    # Solve 2-parameter model: P = CP + W'/t
+    # p1 = CP + W'/d1, p2 = CP + W'/d2
+    # → W' = (p1 - p2) * d1 * d2 / (d2 - d1)
+    # → CP = p1 - W'/d1
+    w_prime = (p1 - p2) * d1 * d2 / (d2 - d1)
+    cp = p1 - w_prime / d1
+
+    # Sanity: CP should be near or slightly above the longest-duration anchor
+    min_cp = anchors[sorted_durs[-1]] * 0.90
+    cp = max(cp, min_cp)
+    w_prime = max(w_prime, 1000)  # At least 1kJ
+
+    return cp, w_prime
+
+
+def compute_wprime_balance(
+    power_array: np.ndarray,
+    time_array: np.ndarray,
+    cp: float,
+    w_prime: float
+) -> np.ndarray:
+    """
+    Compute W' balance at every point using the Skiba differential model.
+
+    When power > CP: W' depletes linearly at (P - CP) watts.
+    When power <= CP: W' recovers exponentially toward W'_max.
+    Recovery is faster the further below CP you ride (rewards genuine rest).
+
+    Args:
+        power_array: Power values at each point
+        time_array: Cumulative time at each point
+        cp: Critical Power (W)
+        w_prime: W' anaerobic capacity (J)
+
+    Returns:
+        Array of W' balance values (same length as power_array)
+    """
+    n = len(power_array)
+    w_bal = np.zeros(n)
+    w_bal[0] = w_prime  # Full tank at race start
+
+    for i in range(n - 1):
+        dt = time_array[i + 1] - time_array[i]
+        if dt <= 0:
+            w_bal[i + 1] = w_bal[i]
+            continue
+
+        p = power_array[i]
+        if p > cp:
+            # Depletion: linear drain
+            w_bal[i + 1] = w_bal[i] - (p - cp) * dt
+        else:
+            # Recovery: exponential reconstitution (Skiba 2015)
+            # Rate proportional to how far below CP — deeper rest = faster recovery
+            recovery_rate = (cp - p) / w_prime
+            w_bal[i + 1] = w_prime - (w_prime - w_bal[i]) * math.exp(-recovery_rate * dt)
+
+    return w_bal
+
+
+def compute_wprime_penalty(
+    power_array: np.ndarray,
+    time_array: np.ndarray,
+    pdc: PDCModel,
+    penalty_weight: float = 50.0,
+    safety_fraction: float = 0.0
+) -> float:
+    """
+    Compute penalty based on W' balance depletion.
+
+    Uses the differential W' balance model (Skiba) to track anaerobic
+    capacity throughout the race. Penalizes every point where W' goes
+    negative (physiologically impossible state).
+
+    Per-point penalty gives L-BFGS-B gradient signal at all violation
+    points, not just the worst one. Weight is low enough (~50) that the
+    optimizer can trade small W' dips for meaningful time savings on
+    steep terrain.
+
+    Args:
+        power_array: Power values at each point
+        time_array: Cumulative time at each point
+        pdc: PDC model (provides cp and w_prime)
+        penalty_weight: Multiplier per point (default 50)
+        safety_fraction: Minimum W' reserve as fraction of W'_max (default 0%)
+
+    Returns:
+        Penalty value (0 if W' stays non-negative throughout)
+    """
+    # Use 2-parameter CP/W' estimates instead of fitted model values
+    cp, w_prime = estimate_cp_wprime(pdc)
+    w_bal = compute_wprime_balance(power_array, time_array, cp, w_prime)
+
+    # Penalize every point where W' goes below zero
+    # This gives gradient signal at all violation points so L-BFGS-B
+    # knows which segments to reduce power on
+    deficits = np.maximum(0, -w_bal)
+    normalized = deficits / w_prime
+
+    return penalty_weight * np.sum(normalized ** 2)
 
 
 def format_duration(seconds: int) -> str:

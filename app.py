@@ -375,7 +375,7 @@ def sidebar_inputs():
             smoothing_window = st.number_input("Elevation Smoothing Window", min_value=3, max_value=15,
                                                value=5, step=2, key='w_smoothing')
             regularization = st.slider("Pacing Smoothness", min_value=0.01, max_value=2.0,
-                                       value=0.5, step=0.05, key='w_regularization',
+                                       value=0.1, step=0.05, key='w_regularization',
                                        help="Higher = smoother power changes between segments")
             grade_seg_threshold = st.number_input("Segment Grade Threshold (%)", min_value=0.5,
                                                   max_value=5.0, value=2.0, step=0.5, key='w_grade_seg')
@@ -813,21 +813,32 @@ def main():
              generate_clicked, compare_clicked,
              alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero) = sidebar_inputs()
 
+            # Cache inputs so they survive panel minimization
+            st.session_state['_cached_inputs'] = (
+                rider, anchors, equipment, environment, advanced,
+                alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero
+            )
+
             # Auto-minimize after Generate Plan is clicked
             if generate_clicked:
                 st.session_state.panel_minimized = True
         else:
-            # Provide safe defaults so _main_content can still read session state
-            rider = {'mass': 88, 'rider_weight': 80, 'bike_weight': 8, 'ftp': 350, 'hr_max': 195}
-            anchors = {}
-            equipment = {'bike_type': 'tt', 'cda_aero': 0.22, 'cda_non_aero': 0.28,
-                         'cda_road': 0.32, 'grade_threshold': 5.0, 'speed_threshold_ms': 6.11, 'crr': 0.0029}
-            advanced = {'smoothing_window': 5, 'regularization': 0.5, 'grade_seg_threshold': 2.0,
-                        'min_segment_m': 200, 'min_segment_duration_s': 30, 'target_segments': 6}
-            environment = {'use_forecast': False, 'temp': 20, 'pressure': 1013,
-                           'humidity': 50, 'wind_speed_ms': 0, 'wind_dir': 0}
+            # Restore last known inputs from cache rather than using hardcoded defaults
+            cached = st.session_state.get('_cached_inputs')
+            if cached:
+                (rider, anchors, equipment, environment, advanced,
+                 alt_bike_weight, alt_cda, alt_cda_aero, alt_cda_non_aero) = cached
+            else:
+                rider = {'mass': 88, 'rider_weight': 80, 'bike_weight': 8, 'ftp': 350, 'hr_max': 195}
+                anchors = {}
+                equipment = {'bike_type': 'tt', 'cda_aero': 0.22, 'cda_non_aero': 0.28,
+                             'cda_road': 0.32, 'grade_threshold': 5.0, 'speed_threshold_ms': 6.11, 'crr': 0.0029}
+                advanced = {'smoothing_window': 5, 'regularization': 0.1, 'grade_seg_threshold': 2.0,
+                            'min_segment_m': 200, 'min_segment_duration_s': 30, 'target_segments': 6}
+                environment = {'use_forecast': False, 'temp': 20, 'pressure': 1013,
+                               'humidity': 50, 'wind_speed_ms': 0, 'wind_dir': 0}
+                alt_bike_weight = alt_cda = alt_cda_aero = alt_cda_non_aero = None
             generate_clicked = compare_clicked = False
-            alt_bike_weight = alt_cda = alt_cda_aero = alt_cda_non_aero = None
 
     with col_out:
         _main_content(rider, anchors, equipment, environment, advanced,

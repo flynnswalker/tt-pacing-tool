@@ -11,7 +11,7 @@ import time
 from gpx_io import Course
 from weather import WeatherData
 from physics import PhysicsConfig, simulate_course, SimulationResult
-from pdc import PDCModel, compute_pdc_penalty, check_feasibility
+from pdc import PDCModel, compute_wprime_penalty, compute_wprime_balance, estimate_cp_wprime, check_feasibility
 
 
 @dataclass
@@ -28,15 +28,15 @@ class ProgressUpdate:
 @dataclass
 class OptimizationConfig:
     """Configuration for the optimizer."""
-    regularization: float = 0.5       # Penalty weight for power variability (increased for smoother plans)
-    pdc_penalty_weight: float = 10000.0  # Penalty weight for PDC violations (10x higher)
-    max_iterations: int = 30          # Maximum solver iterations (most gains come very early)
+    regularization: float = 0.1        # Penalty weight for jitter around grade-proportional baseline
+    pdc_penalty_weight: float = 50.0    # Penalty weight for W' balance depletion (per-point, resolution-normalized)
+    max_iterations: int = 100         # Maximum solver iterations
     tolerance: float = 1.0            # Convergence tolerance (1 second is plenty)
     initial_power_frac: float = 0.95  # Initial power as fraction of FTP
     verbose: bool = False
     progress_callback: Optional[Callable[[ProgressUpdate], None]] = None
     early_stop_threshold: float = 3.0  # Stop if improvement < 3 seconds over recent evals
-    max_time_s: float = 30.0          # Maximum optimization time in seconds
+    max_time_s: float = 60.0          # Maximum optimization time in seconds
 
 
 @dataclass 
@@ -83,17 +83,23 @@ class ObjectiveTracker:
     def check_and_report(self, power_array: np.ndarray, total_time: float, objective_value: float):
         """
         Check termination conditions and report progress.
-        
+
         Raises EarlyStopException if we should terminate.
         """
         self.eval_count += 1
         current_time = time.time()
         elapsed = current_time - self.start_time
-        
-        # Check for significant improvement (> 0.5 seconds)
-        improved = total_time < self.best_time - 0.5
-        
+
+        # Track improvement based on objective value, not just time
+        # This prevents early stopping while the optimizer is reducing
+        # W' penalty (which increases time but improves feasibility)
+        if not hasattr(self, 'best_objective'):
+            self.best_objective = float('inf')
+
+        improved = objective_value < self.best_objective - 0.5
+
         if improved:
+            self.best_objective = objective_value
             self.best_time = total_time
             self.best_x = power_array.copy()
             self.last_improvement_time = current_time
@@ -101,6 +107,7 @@ class ObjectiveTracker:
             # Store first result even if not "improved"
             self.best_x = power_array.copy()
             self.best_time = total_time
+            self.best_objective = objective_value
         
         # Report every 2 seconds or on improvement
         time_since_report = current_time - self.last_report_time
@@ -144,52 +151,51 @@ def create_objective_function(
 ) -> Callable[[np.ndarray], float]:
     """
     Create the objective function for optimization.
-    
+
     The objective minimizes:
     - Total time
-    - Plus regularization penalty for power variability
-    - Plus soft penalty for PDC violations
-    
-    This function also checks termination conditions via the tracker,
-    which will raise EarlyStopException when it's time to stop.
-    
-    Args:
-        course: Course to optimize
-        weather: Weather conditions
-        physics_config: Physics parameters
-        pdc: Power duration curve
-        opt_config: Optimization configuration
-        tracker: Progress tracker (also handles termination)
-        
-    Returns:
-        Objective function that takes power array and returns scalar cost
+    - Plus grade-aware regularization (penalizes jitter, NOT terrain-following)
+    - Plus W' balance penalty (Skiba model — no front-loading bias)
     """
+    # Pre-compute a grade-proportional power profile so the regularization
+    # only penalizes deviations from terrain-following, not the terrain response itself.
+    grades = course.get_grades()
+    cp_est, _ = estimate_cp_wprime(pdc)
+    # Grade-proportional baseline: scale power ~linearly with grade around CP
+    # Steeper grades → higher power, downhill → lower power
+    grade_scale = np.clip(grades / 10.0, -0.2, 0.3)
+    grade_baseline = cp_est * (1 + grade_scale * 0.5)
+
     def objective(power_array: np.ndarray) -> float:
-        # Simulate the course with this power plan
         sim = simulate_course(course, power_array, weather, physics_config)
-        
-        # Base objective: total time
         total_time = sim.total_time_s
-        
-        # Regularization: penalize large power changes
-        power_changes = np.diff(power_array)
-        smoothness_penalty = opt_config.regularization * np.sum(power_changes ** 2)
-        
-        # PDC violation penalty
+
+        # Grade-aware regularization: penalize deviations from grade-proportional
+        # baseline, not raw power changes. This lets the optimizer freely follow
+        # terrain without smoothness cost, while still penalizing random jitter.
+        deviations = power_array - grade_baseline
+        jitter = np.diff(deviations)
+        smoothness_penalty = (opt_config.regularization
+                              * np.sum(jitter ** 2)
+                              / len(power_array))
+
+        # W' balance penalty: tracks anaerobic capacity throughout the race.
+        # Penalizes plans that overdraw W' at any point, with no bias toward
+        # spending W' early vs late. The optimizer freely allocates W' to wherever
+        # it saves the most time (steep gradients).
         times = sim.get_times()
-        pdc_penalty = compute_pdc_penalty(
+        wprime_penalty = compute_wprime_penalty(
             power_array, times, pdc,
             penalty_weight=opt_config.pdc_penalty_weight
         )
-        
-        obj_value = total_time + smoothness_penalty + pdc_penalty
-        
-        # Check termination and report progress (may raise EarlyStopException)
+
+        obj_value = total_time + smoothness_penalty + wprime_penalty
+
         if tracker:
             tracker.check_and_report(power_array, total_time, obj_value)
-        
+
         return obj_value
-    
+
     return objective
 
 
@@ -216,9 +222,9 @@ def create_bounds(
     """
     p_min = physics_config.p_min
     
-    # Upper bound: allow spikes up to ~5-minute power for short climbs
+    # Upper bound: allow spikes up to ~1-minute power for short climbs
     # The PDC penalty ensures overall NP stays within race-duration limits
-    p_max = pdc.max_power(300)  # 5-minute power as upper bound for any segment
+    p_max = pdc.max_power(60)  # 1-minute power as upper bound for any segment
     
     lower = np.full(n_segments, p_min)
     upper = np.full(n_segments, p_max)
@@ -287,63 +293,83 @@ def optimize_pacing(
     
     n_segments = len(course.points)
     ftp = pdc.ftp_estimate()
-    
+
     log(f"Starting optimization for {course.total_distance_m/1000:.1f}km course")
     log(f"Course has {n_segments} segments at 50m resolution")
-    
+
     # Step 1: Estimate initial duration
     log("Step 1/7: Estimating initial duration...")
     initial_duration = estimate_initial_duration(
         course, ftp, weather, physics_config
     )
     log(f"  Initial estimate: {initial_duration:.1f}s ({initial_duration/60:.1f} min)")
-    
+
     # Step 2: Initial estimate for optimization setup
     log("Step 2/7: Setting up initial power estimate...")
     from physics import simulate_constant_power
     initial_power_level = pdc.max_power(initial_duration) * 0.95
     log(f"  Starting optimization from {initial_power_level:.0f}W")
-    
-    # Step 3: Initialize power array
-    log("Step 3/7: Initializing power array with grade adjustments...")
-    initial_power = np.full(n_segments, initial_power_level)
-    
-    # Apply grade-based initial adjustments
+
+    # Step 3: Initialize power array with W'-budget-aware grade allocation
+    # On steeper grades, each watt above CP saves more time (lower speed = more
+    # seconds per meter). So we allocate W' spending proportionally to grade,
+    # not uniformly. This gives the optimizer a much better starting point.
+    log("Step 3/7: Initializing power array with W'-budgeted grade allocation...")
     grades = course.get_grades()
-    grade_adjustment = np.clip(grades / 10.0, -0.2, 0.3)
-    initial_power = initial_power * (1 + grade_adjustment * 0.5)
+    cp_est, wp_est = estimate_cp_wprime(pdc)
+
+    # Estimate time per segment at CP to get segment durations
+    from physics import simulate_course as sim_course_init
+    cp_sim = sim_course_init(course, np.full(n_segments, cp_est), weather, physics_config)
+    seg_times = np.diff(cp_sim.get_times(), prepend=0)
+    seg_times = np.maximum(seg_times, 0.1)  # avoid division by zero
+
+    # Compute "value" of extra power at each point: steeper grade = higher value
+    # Use grade^2 weighting so steep sections get disproportionately more W'
+    grade_value = np.maximum(grades, 0) ** 2  # only spend W' on uphills
+    total_value = np.sum(grade_value * seg_times)
+
+    if total_value > 0:
+        # Allocate W' budget (use 95% to leave a small reserve)
+        w_budget = wp_est * 0.95
+        # Each segment gets W' proportional to its value * duration
+        w_alloc = w_budget * (grade_value * seg_times) / total_value
+        # Convert W' allocation to power above CP: P = CP + W_alloc / duration
+        power_above_cp = w_alloc / seg_times
+        initial_power = cp_est + power_above_cp
+        # On flat/downhill sections, go below CP to recover W'
+        flat_mask = grades <= 0.5
+        initial_power[flat_mask] = cp_est * (0.7 + 0.2 * np.clip(grades[flat_mask] / 0.5, 0, 1))
+    else:
+        initial_power = np.full(n_segments, cp_est)
+
     initial_power = np.clip(initial_power, physics_config.p_min, pdc.max_power(60))
     log(f"  Power range: {initial_power.min():.0f}W - {initial_power.max():.0f}W")
-    
+    log(f"  W' budget: {wp_est*0.95/1000:.1f}kJ across {np.sum(grade_value > 0)} uphill points")
+
     # Step 4: Create objective function and bounds
     log("Step 4/7: Setting up optimizer...")
-    
-    # Create tracker for progress updates (use initial estimate as reference)
     initial_sim = simulate_constant_power(course, initial_power_level, weather, physics_config)
     tracker = ObjectiveTracker(opt_config, initial_sim.total_time_s)
-    
+
     objective = create_objective_function(
         course, weather, physics_config, pdc, opt_config, tracker
     )
-    
-    bounds = create_bounds(
-        n_segments, pdc, physics_config, initial_duration
-    )
+
+    bounds = create_bounds(n_segments, pdc, physics_config, initial_duration)
     log(f"  Power bounds: {bounds.lb[0]:.0f}W - {bounds.ub[0]:.0f}W")
+    diag_cp, diag_wp = estimate_cp_wprime(pdc)
+    log(f"  W' model: CP={diag_cp:.1f}W, W'={diag_wp/1000:.1f}kJ (fitted: CP={pdc.cp:.1f}W, W'={pdc.w_prime/1000:.1f}kJ)")
     log(f"  Max iterations: {opt_config.max_iterations}")
-    
+
     # Step 5: Run optimization
     log("Step 5/7: Running L-BFGS-B optimization...")
     log(f"  Max iterations: {opt_config.max_iterations}, tolerance: {opt_config.tolerance}s")
     log(f"  Max time: {opt_config.max_time_s:.0f}s, early stop if no improvement for 10s")
-    
+
     start_time = time.time()
-    
-    options = {
-        'maxiter': opt_config.max_iterations,
-        'ftol': 1e-6,  # Use tight tolerance; we control stopping via time/improvement
-    }
-    
+    options = {'maxiter': opt_config.max_iterations, 'ftol': 1e-6}
+
     n_iterations = 0
     try:
         result = minimize(
@@ -358,16 +384,15 @@ def optimize_pacing(
         n_iterations = result.nit
         log(f"  Optimizer converged naturally after {n_iterations} iterations")
     except EarlyStopException as e:
-        # Early stopping triggered - use best solution found
         optimized_power = tracker.best_x if tracker.best_x is not None else initial_power
-        converged = True  # We stopped intentionally
+        converged = True
         n_iterations = tracker.eval_count
         log(f"  Early stop: {e}")
-    
+
     opt_elapsed = time.time() - start_time
     log(f"  Completed in {opt_elapsed:.1f}s after {tracker.eval_count} evaluations")
-    
-    # Step 6: Apply smoothing
+
+    # Step 6: Apply smoothing to remove high-frequency noise
     log("Step 6/7: Smoothing power profile...")
     window = min(5, n_segments // 10)
     if window >= 3:
@@ -375,10 +400,9 @@ def optimize_pacing(
         padded = np.pad(optimized_power, (window//2, window//2), mode='edge')
         smoothed = np.convolve(padded, kernel, mode='valid')[:n_segments]
         optimized_power = smoothed
-    
     optimized_power = np.clip(optimized_power, bounds.lb, bounds.ub)
     log(f"  Final power range: {optimized_power.min():.0f}W - {optimized_power.max():.0f}W")
-    
+
     # Step 7: Final simulation and validation
     log("Step 7/7: Validating final plan...")
     final_sim = simulate_course(course, optimized_power, weather, physics_config)
@@ -397,12 +421,22 @@ def optimize_pacing(
     time_saved = baseline_sim.total_time_s - final_sim.total_time_s
     time_saved_pct = (time_saved / baseline_sim.total_time_s) * 100 if baseline_sim.total_time_s > 0 else 0
     
+    # W' balance summary — use 2-parameter estimates for consistency with penalty
+    est_cp, est_wprime = estimate_cp_wprime(pdc)
+    final_times = final_sim.get_times()
+    w_bal = compute_wprime_balance(optimized_power, final_times, est_cp, est_wprime)
+    w_prime_used = est_wprime - np.min(w_bal)
+    w_prime_pct = (w_prime_used / est_wprime) * 100
+
     log(f"")
     log(f"=== OPTIMIZATION COMPLETE ===")
+    log(f"  CP (2-param estimate): {est_cp:.1f}W, W' (2-param estimate): {est_wprime/1000:.1f}kJ")
     log(f"  Optimized time: {final_sim.total_time_s:.1f}s ({final_sim.total_time_s/60:.1f} min)")
     log(f"  Avg power: {final_sim.avg_power_w:.0f}W, NP: {optimized_np:.0f}W")
     log(f"  Baseline (constant {optimized_np:.0f}W): {baseline_sim.total_time_s:.1f}s")
     log(f"  Time saved by variable pacing: {time_saved:.1f}s ({time_saved_pct:.1f}%)")
+    log(f"  W' used: {w_prime_used/1000:.1f}kJ of {est_wprime/1000:.1f}kJ ({w_prime_pct:.0f}%)")
+    log(f"  W' remaining at lowest: {np.min(w_bal)/1000:.1f}kJ")
     log(f"  PDC violations: {len(violations)}")
     
     return OptimizationResult(

@@ -203,17 +203,30 @@ def find_gradient_kinks(
             if not kinks or i - kinks[-1] > 5:
                 kinks.append(i)
 
-    # Also explicitly add points where the smoothed grade crosses zero
-    # (uphill <-> downhill transitions) — these are always critical boundaries
+    # Also explicitly add points where the grade crosses zero
+    # (uphill <-> downhill transitions) — these are always critical boundaries.
+    # IMPORTANT: detect on smoothed data but then snap the boundary back to the
+    # actual crossing in the RAW grades. Smoothing displaces the zero-crossing
+    # by 1-2 points, which puts the boundary inside the wrong terrain type.
     flat_threshold = 0.5  # grades within ±0.5% are considered "flat"
     for i in range(1, len(smoothed)):
         prev, curr = smoothed[i - 1], smoothed[i]
-        # Sign change (uphill to downhill or vice versa)
-        if prev * curr < 0:
-            kinks.append(i)
-        # Transition into or out of a flat section
-        elif (abs(prev) > flat_threshold) != (abs(curr) > flat_threshold):
-            kinks.append(i)
+        is_sign_change = prev * curr < 0
+        is_flat_transition = (abs(prev) > flat_threshold) != (abs(curr) > flat_threshold)
+
+        if is_sign_change or is_flat_transition:
+            # Walk backward in raw grades to find the actual transition point
+            search_start = max(0, i - 4)
+            actual_idx = i
+            for j in range(i, search_start, -1):
+                rp, rc = grades[j - 1], grades[j]
+                if is_sign_change and rp * rc < 0:
+                    actual_idx = j
+                    break
+                elif is_flat_transition and (abs(rp) > flat_threshold) != (abs(rc) > flat_threshold):
+                    actual_idx = j
+                    break
+            kinks.append(actual_idx)
 
     return sorted(set(kinks))
 
